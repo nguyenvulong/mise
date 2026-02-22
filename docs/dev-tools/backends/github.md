@@ -113,8 +113,14 @@ _Instead of specifying the checksum here, you can use [mise.lock](/dev-tools/mis
 version = "latest"
 
 [tools."github:cli/cli".platforms]
-linux-x64 = { asset_pattern = "gh_*_linux_x64.tar.gz", checksum = "sha256:a1b2c3d4e5f6789..." }
-macos-arm64 = { asset_pattern = "gh_*_macOS_arm64.tar.gz", checksum = "sha256:b2c3d4e5f6789..." }
+linux-x64 = {
+  asset_pattern = "gh_*_linux_x64.tar.gz",
+  checksum = "sha256:a1b2c3d4e5f6789...",
+}
+macos-arm64 = {
+  asset_pattern = "gh_*_macOS_arm64.tar.gz",
+  checksum = "sha256:b2c3d4e5f6789...",
+}
 ```
 
 ### `size`
@@ -166,6 +172,27 @@ rename_exe = "yt-dlp"  # Rename the extracted binary to yt-dlp
 
 ::: tip
 Use `rename_exe` for archives where the binary inside has a different name than desired. Use `bin` for single binary downloads (non-archives).
+:::
+
+### `no_app`
+
+Skip macOS .app bundle assets during autodetection and prefer standalone CLI binaries instead. This is useful when a repository provides both a macOS .app bundle (often an Xcode extension or GUI application) and a standalone command-line tool:
+
+```toml
+[tools."github:nicklockwood/SwiftFormat"]
+version = "latest"
+rename_exe = "swiftformat"
+no_app = true  # Skip SwiftFormat.for.Xcode.app.zip, use swiftformat.zip instead
+```
+
+When `no_app = true`:
+
+- Assets containing `.app.` (e.g., `Tool.app.zip`, `Tool.for.Xcode.app.zip`) are penalized during autodetection
+- Standalone archives (e.g., `tool.zip`, `tool-macos.tar.gz`) are preferred
+- Only affects macOS; has no effect on Linux/Windows
+
+::: info
+Without this option, mise's autodetection might select .app bundles on macOS, which can be problematic if the bundle contains a GUI application or Xcode extension rather than a standalone CLI tool.
 :::
 
 ### `bin_path`

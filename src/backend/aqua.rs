@@ -1,5 +1,6 @@
 use crate::backend::VersionInfo;
 use crate::backend::backend_type::BackendType;
+
 use crate::backend::platform_target::PlatformTarget;
 use crate::backend::static_helpers::get_filename_from_url;
 use crate::cli::args::BackendArg;
@@ -52,6 +53,30 @@ impl Backend for AquaBackend {
             .await
             .ok()
             .and_then(|p| p.description.clone())
+    }
+
+    async fn install_operation_count(&self, tv: &ToolVersion, _ctx: &InstallContext) -> usize {
+        let pkg = match AQUA_REGISTRY
+            .package_with_version(&self.id, &[&tv.version])
+            .await
+        {
+            Ok(pkg) => pkg,
+            Err(_) => return 3, // fallback to default
+        };
+        let format = pkg.format(&tv.version, os(), arch()).unwrap_or_default();
+
+        let mut count = 1; // download
+        // Count checksum operation if explicitly configured OR if this is a GitHub release
+        // (GitHub API may provide a digest even without explicit checksum config)
+        if pkg.checksum.as_ref().is_some_and(|c| c.enabled())
+            || pkg.r#type == AquaPackageType::GithubRelease
+        {
+            count += 1;
+        }
+        if needs_extraction(format, &pkg.r#type) {
+            count += 1;
+        }
+        count
     }
 
     async fn security_info(&self) -> Vec<crate::backend::SecurityFeature> {
@@ -269,14 +294,26 @@ impl Backend for AquaBackend {
         let tag = if existing_platform.is_some() {
             None // We'll determine version from URL instead
         } else {
-            self.get_version_tags()
-                .await
-                .ok()
-                .into_iter()
-                .flatten()
-                .find(|(version, _)| version == &tv.version)
-                .map(|(_, tag)| tag.clone())
+            match self.get_version_tags().await {
+                Ok(tags) => tags
+                    .iter()
+                    .find(|(version, _)| version == &tv.version)
+                    .map(|(_, tag)| tag.clone()),
+                Err(e) => {
+                    warn!(
+                        "[{}] failed to fetch version tags, URL may be incorrect: {e}",
+                        self.id
+                    );
+                    None
+                }
+            }
         };
+        if tag.is_none() && existing_platform.is_none() && !tv.version.starts_with('v') {
+            debug!(
+                "[{}] no tag found for version {}, will try with 'v' prefix",
+                self.id, tv.version
+            );
+        }
         let mut v = tag.clone().unwrap_or_else(|| tv.version.clone());
         let mut v_prefixed =
             (tag.is_none() && !tv.version.starts_with('v')).then(|| format!("v{v}"));
@@ -301,83 +338,127 @@ impl Backend for AquaBackend {
             });
         }
         validate(&pkg)?;
-        let (url, v, filename, api_digest) =
-            if let Some(existing_platform) = existing_platform.clone() {
-                let url = existing_platform;
-                let filename = get_filename_from_url(&url);
-                // Determine which version variant was used based on the URL or filename
-                // Check for version_prefix (e.g., "jq-" for jq), "v" prefix, or raw version
-                let v = if let Some(prefix) = &pkg.version_prefix {
-                    let prefixed_version = format!("{prefix}{}", tv.version);
-                    if url.contains(&prefixed_version) || filename.contains(&prefixed_version) {
-                        prefixed_version
-                    } else if url.contains(&format!("v{}", tv.version))
-                        || filename.contains(&format!("v{}", tv.version))
-                    {
-                        format!("v{}", tv.version)
-                    } else {
-                        tv.version.clone()
-                    }
+
+        // Validate lockfile URL matches expected asset pattern from registry
+        // This handles cases where the registry format changed (e.g., raw binary -> tar.gz)
+        // Only validate for GithubRelease packages - other types use fixed URL formats
+        let validated_url = if let Some(ref url) = existing_platform {
+            if pkg.r#type != AquaPackageType::GithubRelease {
+                existing_platform // Skip validation for non-release package types
+            } else {
+                let cached_filename = get_filename_from_url(url);
+                let cached_filename_lower = cached_filename.to_lowercase();
+                // Check assets for both version variants (with and without v prefix)
+                let version_variants: Vec<&str> = match &v_prefixed {
+                    Some(vp) => vec![v.as_str(), vp.as_str()],
+                    None => vec![v.as_str()],
+                };
+                let matches = version_variants.iter().any(|ver| {
+                    pkg.asset_strs(ver, os(), arch())
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|expected| {
+                            // Case-insensitive match to align with github_release_asset behavior
+                            cached_filename == *expected
+                                || cached_filename_lower == expected.to_lowercase()
+                        })
+                });
+                if matches {
+                    existing_platform
+                } else {
+                    warn!(
+                        "lockfile asset '{}' doesn't match registry, refreshing",
+                        cached_filename
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let (url, v, filename, api_digest) = if let Some(validated_url) = validated_url.clone() {
+            let url = validated_url;
+            let filename = get_filename_from_url(&url);
+            // Determine which version variant was used based on the URL or filename
+            // Check for version_prefix (e.g., "jq-" for jq), "v" prefix, or raw version
+            let v = if let Some(prefix) = &pkg.version_prefix {
+                let prefixed_version = format!("{prefix}{}", tv.version);
+                if url.contains(&prefixed_version) || filename.contains(&prefixed_version) {
+                    prefixed_version
                 } else if url.contains(&format!("v{}", tv.version))
                     || filename.contains(&format!("v{}", tv.version))
                 {
                     format!("v{}", tv.version)
                 } else {
                     tv.version.clone()
-                };
-                (url, v, filename, None)
+                }
+            } else if url.contains(&format!("v{}", tv.version))
+                || filename.contains(&format!("v{}", tv.version))
+            {
+                format!("v{}", tv.version)
             } else {
-                let (url, v, digest) = if let Some(v_prefixed) = v_prefixed {
-                    // Try v-prefixed version first because most aqua packages use v-prefixed versions
-                    match self.get_url(&pkg, v_prefixed.as_ref()).await {
-                        // If the url is already checked, use it
-                        Ok((url, true, digest)) => (url, v_prefixed, digest),
-                        Ok((url_prefixed, false, digest_prefixed)) => {
-                            let (url, _, digest) = self.get_url(&pkg, &v).await?;
-                            // If the v-prefixed URL is the same as the non-prefixed URL, use it
-                            if url == url_prefixed {
-                                (url_prefixed, v_prefixed, digest_prefixed)
-                            } else {
-                                // If they are different, check existence
-                                match HTTP.head(&url_prefixed).await {
-                                    Ok(_) => (url_prefixed, v_prefixed, digest_prefixed),
-                                    Err(_) => (url, v, digest),
-                                }
+                tv.version.clone()
+            };
+            (url, v, filename, None)
+        } else {
+            let (url, v, digest) = if let Some(v_prefixed) = v_prefixed {
+                // Try v-prefixed version first because most aqua packages use v-prefixed versions
+                match self.get_url(&pkg, v_prefixed.as_ref()).await {
+                    // If the url is already checked, use it
+                    Ok((url, true, digest)) => (url, v_prefixed, digest),
+                    Ok((url_prefixed, false, digest_prefixed)) => {
+                        let (url, _, digest) = self.get_url(&pkg, &v).await?;
+                        // If the v-prefixed URL is the same as the non-prefixed URL, use it
+                        if url == url_prefixed {
+                            (url_prefixed, v_prefixed, digest_prefixed)
+                        } else {
+                            // If they are different, check existence
+                            match HTTP.head(&url_prefixed).await {
+                                Ok(_) => (url_prefixed, v_prefixed, digest_prefixed),
+                                Err(_) => (url, v, digest),
                             }
                         }
-                        Err(err) => {
-                            let (url, _, digest) =
-                                self.get_url(&pkg, &v).await.map_err(|e| err.wrap_err(e))?;
-                            (url, v, digest)
-                        }
                     }
-                } else {
-                    let (url, _, digest) = self.get_url(&pkg, &v).await?;
-                    (url, v, digest)
-                };
-                let filename = get_filename_from_url(&url);
-
-                (url, v.to_string(), filename, digest)
+                    Err(err) => {
+                        let (url, _, digest) =
+                            self.get_url(&pkg, &v).await.map_err(|e| err.wrap_err(e))?;
+                        (url, v, digest)
+                    }
+                }
+            } else {
+                let (url, _, digest) = self.get_url(&pkg, &v).await?;
+                (url, v, digest)
             };
+            let filename = get_filename_from_url(&url);
 
-        // Determine operation count for progress reporting
+            (url, v.to_string(), filename, digest)
+        };
+
         let format = pkg.format(&v, os(), arch()).unwrap_or_default();
-        let op_count = Self::calculate_op_count(&pkg, &api_digest, format);
-        ctx.pr.start_operations(op_count);
 
         self.download(ctx, &tv, &url, &filename).await?;
 
-        if existing_platform.is_none() {
+        if validated_url.is_none() {
             // Store the asset URL and digest (if available) in the tool version
             let platform_info = tv.lock_platforms.entry(platform_key).or_default();
             platform_info.url = Some(url.clone());
-            if let Some(digest) = api_digest {
+            if let Some(digest) = api_digest.clone() {
                 debug!("using GitHub API digest for checksum verification");
                 platform_info.checksum = Some(digest);
             }
         }
 
+        // Advance to checksum operation if applicable
+        if pkg.checksum.as_ref().is_some_and(|c| c.enabled()) || api_digest.is_some() {
+            ctx.pr.next_operation();
+        }
         self.verify(ctx, &mut tv, &pkg, &v, &filename).await?;
+
+        // Advance to extraction operation if applicable
+        if needs_extraction(format, &pkg.r#type) {
+            ctx.pr.next_operation();
+        }
         self.install(ctx, &tv, &pkg, &v, &filename)?;
 
         Ok(tv)
@@ -470,25 +551,37 @@ impl Backend for AquaBackend {
         };
 
         // Get version tag
-        let tag = self
-            .get_version_tags()
-            .await
-            .ok()
-            .into_iter()
-            .flatten()
-            .find(|(version, _)| version == &tv.version)
-            .map(|(_, tag)| tag);
-        let mut v = tag.cloned().unwrap_or_else(|| tv.version.clone());
-        let v_prefixed = (tag.is_none() && !tv.version.starts_with('v')).then(|| format!("v{v}"));
+        let tag = match self.get_version_tags().await {
+            Ok(tags) => tags
+                .iter()
+                .find(|(version, _)| version == &tv.version)
+                .map(|(_, tag)| tag.clone()),
+            Err(e) => {
+                warn!(
+                    "[{}] failed to fetch version tags for lockfile, URL may be incorrect: {e}",
+                    self.id
+                );
+                None
+            }
+        };
+        let tag_is_none = tag.is_none();
+        if tag_is_none && !tv.version.starts_with('v') {
+            debug!(
+                "[{}] no tag found for version {} during lock, will try with 'v' prefix",
+                self.id, tv.version
+            );
+        }
+        let mut v = tag.unwrap_or_else(|| tv.version.clone());
+        let v_prefixed = (tag_is_none && !tv.version.starts_with('v')).then(|| format!("v{v}"));
         let versions = match &v_prefixed {
             Some(v_prefixed) => vec![v.as_str(), v_prefixed.as_str()],
             None => vec![v.as_str()],
         };
 
-        // Get package with version for the target platform
-        let pkg = AQUA_REGISTRY
-            .package_with_version(&self.id, &versions)
-            .await?;
+        // Get package and apply version/overrides directly for the target platform.
+        // Using package_with_version() here would apply overrides for the current host
+        // platform first, which can leak host-specific overrides into cross-platform lock.
+        let pkg = AQUA_REGISTRY.package(&self.id).await?;
         let pkg = pkg.with_version(&versions, target_os, target_arch);
 
         // Apply version prefix if present
@@ -625,35 +718,17 @@ impl AquaBackend {
                 .github_release_url(pkg, v)
                 .await
                 .map(|(url, digest)| (url, true, digest)),
-            AquaPackageType::GithubArchive | AquaPackageType::GithubContent => {
-                Ok((self.github_archive_url(pkg, v), false, None))
+            AquaPackageType::GithubContent => {
+                if pkg.path.is_some() {
+                    Ok((self.github_content_url(pkg, v), false, None))
+                } else {
+                    bail!("github_content package requires `path`")
+                }
             }
+            AquaPackageType::GithubArchive => Ok((self.github_archive_url(pkg, v), false, None)),
             AquaPackageType::Http => pkg.url(v, os(), arch()).map(|url| (url, false, None)),
             ref t => bail!("unsupported aqua package type: {t}"),
         }
-    }
-
-    /// Calculate the number of operations for progress reporting.
-    /// Operations: download (always), checksum (if enabled or api_digest), extraction (if needed)
-    fn calculate_op_count(pkg: &AquaPackage, api_digest: &Option<String>, format: &str) -> usize {
-        let mut op_count = 1; // download
-
-        // Checksum verification (from pkg config or GitHub API digest)
-        if pkg.checksum.as_ref().is_some_and(|c| c.enabled()) || api_digest.is_some() {
-            op_count += 1;
-        }
-
-        // Extraction (for archives, or GithubArchive/GithubContent which always extract)
-        if (!format.is_empty() && format != "raw")
-            || matches!(
-                pkg.r#type,
-                AquaPackageType::GithubArchive | AquaPackageType::GithubContent
-            )
-        {
-            op_count += 1;
-        }
-
-        op_count
     }
 
     async fn github_release_url(
@@ -696,6 +771,12 @@ impl AquaBackend {
     fn github_archive_url(&self, pkg: &AquaPackage, v: &str) -> String {
         let gh_id = format!("{}/{}", pkg.repo_owner, pkg.repo_name);
         format!("https://github.com/{gh_id}/archive/refs/tags/{v}.tar.gz")
+    }
+
+    fn github_content_url(&self, pkg: &AquaPackage, v: &str) -> String {
+        let gh_id = format!("{}/{}", pkg.repo_owner, pkg.repo_name);
+        let path = pkg.path.as_deref().unwrap();
+        format!("https://raw.githubusercontent.com/{gh_id}/{v}/{path}")
     }
 
     /// Fetch checksum from a checksum file without downloading the actual tarball.
@@ -1338,7 +1419,7 @@ impl AquaBackend {
         let first_bin_path = bin_paths
             .first()
             .expect("at least one bin path should exist");
-        let mut tar_opts = TarOptions {
+        let tar_opts = TarOptions {
             format: format.parse().unwrap_or_default(),
             pr: Some(ctx.pr.as_ref()),
             strip_components: 0,
@@ -1348,8 +1429,9 @@ impl AquaBackend {
         if let AquaPackageType::GithubArchive = pkg.r#type {
             file::untar(&tarball_path, &install_path, &tar_opts)?;
         } else if let AquaPackageType::GithubContent = pkg.r#type {
-            tar_opts.strip_components = 1;
-            file::untar(&tarball_path, &install_path, &tar_opts)?;
+            file::create_dir_all(&install_path)?;
+            file::copy(&tarball_path, first_bin_path)?;
+            make_executable = true;
         } else if format == "raw" {
             file::create_dir_all(&install_path)?;
             file::copy(&tarball_path, first_bin_path)?;
@@ -1556,6 +1638,15 @@ fn resolve_repo_info(
         .cloned()
         .unwrap_or_else(|| pkg.repo_name.clone());
     (owner, name)
+}
+
+/// Check if extraction is needed based on format and package type.
+fn needs_extraction(format: &str, pkg_type: &AquaPackageType) -> bool {
+    (!format.is_empty() && format != "raw")
+        || matches!(
+            pkg_type,
+            AquaPackageType::GithubArchive | AquaPackageType::GithubContent
+        )
 }
 
 /// Check if a platform is supported by the package's supported_envs.

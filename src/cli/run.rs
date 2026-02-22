@@ -9,6 +9,7 @@ use crate::cli::{Cli, unescape_task_args};
 use crate::config::{Config, Settings};
 use crate::duration;
 use crate::env;
+use crate::file::display_path;
 use crate::prepare::{PrepareEngine, PrepareOptions};
 use crate::task::has_any_args_defined;
 use crate::task::task_helpers::task_needs_permit;
@@ -17,7 +18,7 @@ use crate::task::task_output::TaskOutput;
 use crate::task::task_output_handler::OutputHandler;
 use crate::task::{Deps, Task};
 use crate::toolset::{InstallOptions, ToolsetBuilder};
-use crate::ui::{ctrlc, style};
+use crate::ui::{ctrlc, info, style};
 use clap::{CommandFactory, ValueHint};
 use eyre::{Result, bail, eyre};
 use itertools::Itertools;
@@ -83,7 +84,7 @@ pub struct Run {
 
     /// Print directly to stdout/stderr instead of by line
     /// Defaults to true if --jobs == 1
-    /// Configure with `task_output` config or `MISE_TASK_OUTPUT` env var
+    /// Configure with `task.output` config or `MISE_TASK_OUTPUT` env var
     #[clap(
         long,
         short,
@@ -117,7 +118,7 @@ pub struct Run {
 
     /// Print stdout/stderr by line, prefixed with the task's label
     /// Defaults to true if --jobs > 1
-    /// Configure with `task_output` config or `MISE_TASK_OUTPUT` env var
+    /// Configure with `task.output` config or `MISE_TASK_OUTPUT` env var
     #[clap(
         long,
         short,
@@ -249,14 +250,14 @@ impl Run {
                 // Get usage spec to check if task has defined args/flags
                 let spec = task.parse_usage_spec_for_display(&config).await?;
 
-                // Only show mise help if the task has usage args/flags defined
-                // Otherwise, pass --help through to the underlying command
                 if has_any_args_defined(&spec) {
-                    // Render help using usage library
+                    // Task has usage args/flags defined, render help using usage library
                     println!("{}", usage::docs::cli::render_help(&spec, &spec.cmd, true));
-                    return Ok(());
+                } else {
+                    // Task has no usage defined, show basic task info
+                    display_task_help(task)?;
                 }
-                // Task has no usage defined - fall through to execute with --help passed to task
+                return Ok(());
             } else {
                 // No task found, show run command help
                 self.get_clap_command().print_long_help()?;
@@ -276,23 +277,10 @@ impl Run {
             raw: self.raw,
             ..Default::default()
         };
-        ts.install_missing_versions(&mut config, &opts).await?;
-
-        // Run auto-enabled prepare steps (unless --no-prepare)
-        if !self.no_prepare {
-            let env = ts.env_with_path(&config).await?;
-            let engine = PrepareEngine::new(config.clone())?;
-            engine
-                .run(PrepareOptions {
-                    auto_only: true, // Only run providers with auto=true
-                    env,
-                    ..Default::default()
-                })
-                .await?;
-        }
+        let _ = ts.install_missing_versions(&mut config, &opts).await?;
 
         if !self.skip_deps {
-            self.skip_deps = Settings::get().task_skip_depends;
+            self.skip_deps = Settings::get().task.skip_depends;
         }
 
         time!("run init");
@@ -313,6 +301,31 @@ impl Run {
             }
         }
         time!("run get_task_lists");
+
+        // Run auto-enabled prepare steps (unless --no-prepare)
+        // This runs after task resolution so we can discover prepare providers
+        // from monorepo subdirectory configs referenced by the resolved tasks.
+        if !self.no_prepare {
+            let env = ts.env_with_path(&config).await?;
+            let mut engine = PrepareEngine::new(&config)?;
+
+            // Collect subdirectory config files from resolved tasks
+            let subdir_configs: Vec<_> = task_list
+                .iter()
+                .filter_map(|task| task.cf.clone())
+                .collect();
+            if !subdir_configs.is_empty() {
+                engine.add_config_files(subdir_configs);
+            }
+
+            engine
+                .run(PrepareOptions {
+                    auto_only: true, // Only run providers with auto=true
+                    env,
+                    ..Default::default()
+                })
+                .await?;
+        }
 
         // Apply global timeout for entire run if configured
         let timeout = if let Some(timeout_str) = &self.timeout {
@@ -408,16 +421,20 @@ impl Run {
         ctx: crate::task::task_scheduler::SpawnContext,
     ) -> Result<()> {
         // If we're already stopping due to a previous failure and not in
-        // continue-on-error mode, do not launch this task. Ensure we remove
-        // it from the dependency graph so the scheduler can make progress.
+        // continue-on-error mode, do not launch this task unless it's a
+        // post-dependency (cleanup task that should run even on failure).
         if this.is_stopping() && !this.continue_on_error {
-            trace!(
-                "aborting spawn before start (not continue-on-error): {} {}",
-                task.name,
-                task.args.join(" ")
-            );
-            deps_for_remove.lock().await.remove(&task);
-            return Ok(());
+            let mut deps = deps_for_remove.lock().await;
+            if !deps.is_runnable_post_dep(&task) {
+                trace!(
+                    "aborting spawn before start (not continue-on-error): {} {}",
+                    task.name,
+                    task.args.join(" ")
+                );
+                deps.remove(&task);
+                return Ok(());
+            }
+            drop(deps);
         }
         let needs_permit = task_needs_permit(&task);
         let permit_opt = if needs_permit {
@@ -429,18 +446,22 @@ impl Run {
                 wait_start.elapsed().as_millis()
             );
             // If a failure occurred while we were waiting for a permit and we're not
-            // in continue-on-error mode, skip launching this task. This prevents
-            // subsequently queued tasks (e.g., from CLI ":::" groups) from running
-            // after the first failure when --jobs=1 and ensures immediate stop.
+            // in continue-on-error mode, skip launching this task unless it's a
+            // post-dependency (cleanup task). This prevents subsequently queued
+            // tasks from running after failure, while still allowing cleanup.
             if this.is_stopping() && !this.continue_on_error {
-                trace!(
-                    "aborting spawn after failure (not continue-on-error): {} {}",
-                    task.name,
-                    task.args.join(" ")
-                );
-                // Remove from deps so the scheduler can drain and not hang
-                deps_for_remove.lock().await.remove(&task);
-                return Ok(());
+                let mut deps = deps_for_remove.lock().await;
+                if !deps.is_runnable_post_dep(&task) {
+                    trace!(
+                        "aborting spawn after failure (not continue-on-error): {} {}",
+                        task.name,
+                        task.args.join(" ")
+                    );
+                    // Remove from deps so the scheduler can drain and not hang
+                    deps.remove(&task);
+                    return Ok(());
+                }
+                drop(deps);
             }
             p
         } else {
@@ -473,6 +494,11 @@ impl Run {
                     };
                 }
                 this.add_failed_task(task.clone(), status);
+            }
+            if let Some(oh) = &this.output_handler
+                && oh.output(None) == TaskOutput::KeepOrder
+            {
+                oh.keep_order_state.lock().unwrap().on_task_finished(&task);
             }
             deps_for_remove.lock().await.remove(&task);
             trace!("deps removed: {} {}", task.name, task.args.join(" "));
@@ -648,6 +674,39 @@ impl Run {
     }
 }
 
+fn display_task_help(task: &Task) -> Result<()> {
+    let name = if task.display_name.is_empty() {
+        &task.name
+    } else {
+        &task.display_name
+    };
+    info::inline_section("Task", name)?;
+    if !task.aliases.is_empty() {
+        info::inline_section("Aliases", task.aliases.join(", "))?;
+    }
+    if !task.description.is_empty() {
+        info::inline_section("Description", &task.description)?;
+    }
+    info::inline_section("Source", display_path(&task.config_source))?;
+    if !task.depends.is_empty() {
+        info::inline_section("Depends on", task.depends.iter().join(", "))?;
+    }
+    let run = task.run();
+    if !run.is_empty() {
+        info::section("Run", run.iter().map(|e| e.to_string()).join("\n"))?;
+    }
+    miseprintln!();
+    miseprintln!("This task does not accept any arguments.");
+    let hint = if task.file.is_some() {
+        "To define arguments, add #USAGE comments to the script file."
+    } else {
+        "To define arguments, add a `usage` field to the task definition in the config file."
+    };
+    miseprintln!("{hint}");
+    miseprintln!("See https://mise.jdx.dev/tasks/task-configuration.html for more information.");
+    Ok(())
+}
+
 static AFTER_LONG_HELP: &str = color_print::cstr!(
     r#"<bold><underline>Examples:</underline></bold>
 
@@ -656,11 +715,11 @@ static AFTER_LONG_HELP: &str = color_print::cstr!(
     $ <bold>mise run lint</bold>
 
     # Forces the "build" tasks to run even if its sources are up-to-date.
-    $ <bold>mise run build --force</bold>
+    $ <bold>mise run --force build</bold>
 
     # Run "test" with stdin/stdout/stderr all connected to the current terminal.
     # This forces `--jobs=1` to prevent interleaving of output.
-    $ <bold>mise run test --raw</bold>
+    $ <bold>mise run --raw test</bold>
 
     # Runs the "lint", "test", and "check" tasks in parallel.
     $ <bold>mise run lint ::: test ::: check</bold>

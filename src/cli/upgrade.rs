@@ -6,10 +6,13 @@ use crate::config::{Config, Settings, config_file};
 use crate::duration::parse_into_timestamp;
 use crate::file::display_path;
 use crate::toolset::outdated_info::OutdatedInfo;
-use crate::toolset::{InstallOptions, ResolveOptions, ToolVersion, ToolsetBuilder};
+use crate::toolset::{
+    InstallOptions, ResolveOptions, ToolVersion, ToolsetBuilder,
+    get_versions_needed_by_tracked_configs,
+};
 use crate::ui::multi_progress_report::MultiProgressReport;
 use crate::ui::progress_report::SingleReport;
-use crate::{config, ui};
+use crate::{config, exit, runtime_symlinks, ui};
 use console::Term;
 use demand::DemandOption;
 use eyre::{Context, Result, eyre};
@@ -69,6 +72,12 @@ pub struct Upgrade {
     #[clap(long, verbatim_doc_comment)]
     before: Option<String>,
 
+    /// Like --dry-run but exits with code 1 if there are outdated tools
+    ///
+    /// This is useful for scripts to check if tools need to be upgraded.
+    #[clap(long, verbatim_doc_comment)]
+    dry_run_code: bool,
+
     /// Directly pipe stdin/stdout/stderr from plugin to user
     /// Sets --jobs=1
     #[clap(long, overrides_with = "jobs")]
@@ -76,6 +85,10 @@ pub struct Upgrade {
 }
 
 impl Upgrade {
+    fn is_dry_run(&self) -> bool {
+        self.dry_run || self.dry_run_code
+    }
+
     pub async fn run(self) -> Result<()> {
         let mut config = Config::get().await?;
         let ts = ToolsetBuilder::new()
@@ -169,13 +182,12 @@ impl Upgrade {
                     if &o.latest == current {
                         return None;
                     }
-
-                    Some((o, current))
+                    Some((o, current.clone()))
                 })
             })
             .collect();
 
-        if self.dry_run {
+        if self.is_dry_run() {
             for (o, current) in &to_remove {
                 miseprintln!("Would uninstall {}@{}", o.name, current);
             }
@@ -190,13 +202,15 @@ impl Upgrade {
                     display_path(cf.get_path())
                 );
             }
+            if self.dry_run_code {
+                exit::exit(1);
+            }
             return Ok(());
         }
 
         let opts = InstallOptions {
             reason: "upgrade".to_string(),
-            // TODO: can we remove this without breaking e2e/cli/test_upgrade? it may be causing tools to re-install
-            force: true,
+            force: false,
             jobs: self.jobs,
             raw: self.raw,
             resolve_options: ResolveOptions {
@@ -241,12 +255,39 @@ impl Upgrade {
             }
         }
 
+        // Reset config after upgrades so tracked configs resolve with new versions
+        *config = Config::reset().await?;
+
+        // Rebuild symlinks BEFORE getting versions needed by tracked configs
+        // This ensures "latest" symlinks point to the new versions, not the old ones
+        runtime_symlinks::rebuild(config)
+            .await
+            .wrap_err("failed to rebuild runtime symlinks")?;
+
+        // Get versions needed by tracked configs AFTER upgrade
+        // This ensures we don't uninstall versions still needed by other projects
+        let versions_needed_by_tracked = get_versions_needed_by_tracked_configs(config).await?;
+
         // Only uninstall old versions of tools that were successfully upgraded
+        // and are not needed by any tracked config
         for (o, tv) in to_remove {
             if successful_versions
                 .iter()
                 .any(|v| v.ba() == o.tool_version.ba())
             {
+                // Check if this version is still needed by another tracked config
+                let version_key = (
+                    o.tool_version.ba().short.to_string(),
+                    o.tool_version.tv_pathname(),
+                );
+                if versions_needed_by_tracked.contains(&version_key) {
+                    debug!(
+                        "Keeping {}@{} because it's still needed by a tracked config",
+                        o.name, tv
+                    );
+                    continue;
+                }
+
                 let pr = mpr.add(&format!("uninstall {}@{}", o.name, tv));
                 if let Err(e) = self
                     .uninstall_old_version(config, &o.tool_version, pr.as_ref())
@@ -257,7 +298,6 @@ impl Upgrade {
             }
         }
 
-        *config = Config::reset().await?;
         let ts = config.get_toolset().await?;
         config::rebuild_shims_and_runtime_symlinks(config, ts, &successful_versions).await?;
 

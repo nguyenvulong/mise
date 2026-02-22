@@ -1,9 +1,14 @@
 [workspace]
-members = ["crates/vfox", "crates/aqua-registry"]
+members = [
+  "crates/vfox",
+  "crates/aqua-registry",
+  "crates/mise-interactive-config",
+  "crates/mise-shim",
+]
 
 [package]
 name = "mise"
-version = "2026.1.6"
+version = "2026.2.18"
 edition = "2024"
 description = "The front-end to your dev env"
 authors = ["Jeff Dickey (@jdx)"]
@@ -21,7 +26,7 @@ include = [
   "/build.rs",
   "/completions/*",
   "/minisign.pub",
-  "/registry.toml",
+  "/registry/*.toml",
   "/settings.toml",
   "/zipsign.pub",
   "/src/**/*.rs",
@@ -53,6 +58,7 @@ opt-level = 3
 
 [dependencies]
 age = { version = "0.11", features = ["ssh"] }
+aho-corasick = "1"
 anyhow = "1"
 async-backtrace = "0.2"
 async-trait = "0.1"
@@ -89,11 +95,11 @@ digest = "0.10.7"
 dotenvy = "0.15"
 duct = "0.13"
 homedir = "0.3"
-expr-lang = "0.3"
+expr-lang = "1"
 eyre = "0.6"
 filetime = "0.2"
 flate2 = "1"
-sigstore-verification = { version = "0.1", default-features = false }
+sigstore-verification = { version = "0.2", default-features = false }
 fslock = "0.2.1"
 fuzzy-matcher = "0.3"
 gix = { version = "<1", features = ["worktree-mutation"] }
@@ -105,7 +111,7 @@ hex = "0.4"
 humansize = "2"
 indenter = "0.3"
 indexmap = { version = "2", features = ["serde"] }
-indicatif = { version = "0.18", features = ["improved_unicode"] }
+clx = "1"
 indoc = "2"
 itertools = "0.14"
 jiff = "0.2"
@@ -154,6 +160,7 @@ blake3 = "1"
 chacha20poly1305 = "0.10"
 shell-escape = "0.1"
 shell-words = "1"
+shellexpand = "3"
 signal-hook = "0.3"
 siphasher = "1"
 strum = { version = "0.27", features = ["derive"] }
@@ -167,8 +174,8 @@ terminal_size = "0.4"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-retry = "0.3"
-toml = { version = "0.8", features = ["parse"] }
-toml_edit = { version = "0.22", features = ["parse"] }
+toml = { version = "0.9", features = ["parse", "preserve_order"] }
+toml_edit = { version = "0.24", features = ["parse"] }
 ubi = { version = "0.8", default-features = false }
 url = "2"
 urlencoding = "2"
@@ -176,16 +183,17 @@ usage-lib = { version = "2", features = ["clap", "docs"] }
 versions = { version = "6", features = ["serde"] }
 vfox = { path = "crates/vfox", default-features = false }
 aqua-registry = { path = "crates/aqua-registry" }
+mise-interactive-config = { path = "crates/mise-interactive-config", version = "2026.1.12" }
 walkdir = "2"
 which = "7"
-xx = { version = "2", default-features = false, features = ["glob"] }
+xx = { version = "2.5", default-features = false, features = ["glob"] }
 xz2 = "0.1"
 zip = { version = "3", default-features = false, features = ["deflate"] }
 zstd = "0.13"
 
 [target.'cfg(unix)'.dependencies]
 exec = "0.3"
-nix = { version = "0.30", features = ["signal", "user"] }
+nix = { version = "0.30", features = ["signal", "term", "user"] }
 self_update = { version = "0.42", optional = true, default-features = false, features = [
   "archive-tar",
   "compression-flate2",
@@ -200,6 +208,7 @@ self_update = { version = "0.42", optional = true, default-features = false, fea
   "signatures",
   "rustls",
 ] }
+zipsign-api = "0.1"
 sevenz-rust = "0.6"
 winapi = { version = "0.3.9", features = ["consoleapi", "minwindef"] }
 
@@ -207,7 +216,7 @@ winapi = { version = "0.3.9", features = ["consoleapi", "minwindef"] }
 built = { version = "0.8", features = ["chrono"] }
 cfg_aliases = "0.2"
 heck = "0.5"
-toml = "0.8"
+toml = "0.9"
 indexmap = "2"
 serde_yaml = "0.9"
 

@@ -1,13 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::backend::backend_type::BackendType;
-use crate::backend::conda::CondaBackend;
-use crate::backend::platform_target::PlatformTarget;
 use crate::config::Config;
 use crate::file::display_path;
-use crate::lockfile::{self, CondaPackageInfo, Lockfile, PlatformInfo};
+use crate::lockfile::{self, LockResolutionResult, Lockfile};
 use crate::platform::Platform;
 use crate::toolset::Toolset;
 use crate::ui::multi_progress_report::MultiProgressReport;
@@ -16,17 +13,6 @@ use console::style;
 use eyre::Result;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-
-/// Result type for lock task: (short_name, version, backend, platform, info, options, conda_packages)
-type LockTaskResult = (
-    String,
-    String,
-    String,
-    Platform,
-    Option<PlatformInfo>,
-    BTreeMap<String, String>,
-    BTreeMap<String, CondaPackageInfo>,
-);
 
 /// Update lockfile checksums and URLs for all specified platforms
 ///
@@ -67,131 +53,121 @@ impl Lock {
     pub async fn run(self) -> Result<()> {
         let settings = Settings::get();
         let config = Config::get().await?;
-        settings.ensure_experimental("lock")?;
 
-        // Determine lockfile path based on config root
-        let lockfile_path = self.get_lockfile_path(&config);
-
-        // Determine target platforms
-        let target_platforms = self.determine_target_platforms(&lockfile_path)?;
-
-        miseprintln!(
-            "{} Targeting {} platform(s): {}",
-            style("→").cyan(),
-            target_platforms.len(),
-            target_platforms
-                .iter()
-                .map(|p| p.to_key())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-
-        // Get toolset and resolve versions
         let ts = config.get_toolset().await?;
-        let tools = self.get_tools_to_lock(&config, ts);
 
-        if tools.is_empty() {
+        // Two-pass approach: first non-local (mise.lock), then local (mise.local.lock).
+        // With --local, only the local pass runs.
+        let passes: &[bool] = if self.local { &[true] } else { &[false, true] };
+        let mut any_tools = false;
+
+        for &is_local in passes {
+            let lockfile_path = self.get_lockfile_path(&config, is_local);
+            let tools = self.get_tools_to_lock(&config, ts, is_local);
+
+            if tools.is_empty() {
+                continue;
+            }
+            any_tools = true;
+
+            let target_platforms = self.determine_target_platforms(&lockfile_path)?;
+
+            miseprintln!(
+                "{} Targeting {} platform(s) for {}: {}",
+                style("→").cyan(),
+                target_platforms.len(),
+                style(display_path(&lockfile_path)).cyan(),
+                target_platforms
+                    .iter()
+                    .map(|p| p.to_key())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+
+            miseprintln!(
+                "{} Processing {} tool(s): {}",
+                style("→").cyan(),
+                tools.len(),
+                tools
+                    .iter()
+                    .map(|(ba, tv)| format!("{}@{}", ba.short, tv.version))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+
+            if self.dry_run {
+                self.show_dry_run(&tools, &target_platforms)?;
+                continue;
+            }
+
+            // Process tools and update lockfile
+            let mut lockfile = Lockfile::read(&lockfile_path)?;
+            let results = self
+                .process_tools(&settings, &tools, &target_platforms, &mut lockfile)
+                .await?;
+
+            // Save lockfile
+            lockfile.write(&lockfile_path)?;
+
+            // Print summary
+            let successful = results.iter().filter(|(_, _, ok)| *ok).count();
+            let skipped = results.len() - successful;
+            miseprintln!(
+                "{} Updated {} platform entries ({} skipped)",
+                style("✓").green(),
+                successful,
+                skipped
+            );
+            miseprintln!(
+                "{} Lockfile written to {}",
+                style("✓").green(),
+                style(display_path(&lockfile_path)).cyan()
+            );
+        }
+
+        if !any_tools {
             miseprintln!("{} No tools configured to lock", style("!").yellow());
-            return Ok(());
         }
-
-        miseprintln!(
-            "{} Processing {} tool(s): {}",
-            style("→").cyan(),
-            tools.len(),
-            tools
-                .iter()
-                .map(|(ba, tv)| format!("{}@{}", ba.short, tv.version))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-
-        if self.dry_run {
-            self.show_dry_run(&tools, &target_platforms)?;
-            return Ok(());
-        }
-
-        // Process tools and update lockfile
-        let mut lockfile = Lockfile::read(&lockfile_path)?;
-        let results = self
-            .process_tools(&settings, &tools, &target_platforms, &mut lockfile)
-            .await?;
-
-        // Save lockfile
-        lockfile.write(&lockfile_path)?;
-
-        // Print summary
-        let successful = results.iter().filter(|(_, _, ok)| *ok).count();
-        let skipped = results.len() - successful;
-        miseprintln!(
-            "{} Updated {} platform entries ({} skipped)",
-            style("✓").green(),
-            successful,
-            skipped
-        );
-        miseprintln!(
-            "{} Lockfile written to {}",
-            style("✓").green(),
-            style(display_path(&lockfile_path)).cyan()
-        );
 
         Ok(())
     }
 
-    fn get_lockfile_path(&self, config: &Config) -> PathBuf {
-        // Get lockfile path from the first config file
+    /// Get the lockfile path for either the local or non-local pass.
+    fn get_lockfile_path(&self, config: &Config, is_local: bool) -> PathBuf {
+        let lockfile_name = if is_local {
+            "mise.local.lock"
+        } else {
+            "mise.lock"
+        };
         if let Some(config_path) = config.config_files.keys().next() {
             let (lockfile_path, _) = lockfile::lockfile_path_for_config(config_path);
-            if self.local {
-                // Replace mise.lock with mise.local.lock
-                lockfile_path.with_file_name("mise.local.lock")
-            } else {
-                lockfile_path
-            }
+            lockfile_path.with_file_name(lockfile_name)
         } else {
-            // Fallback to current dir
-            let lockfile_name = if self.local {
-                "mise.local.lock"
-            } else {
-                "mise.lock"
-            };
             std::env::current_dir()
                 .unwrap_or_default()
                 .join(lockfile_name)
         }
     }
 
-    fn determine_target_platforms(&self, lockfile_path: &PathBuf) -> Result<Vec<Platform>> {
+    fn determine_target_platforms(&self, lockfile_path: &Path) -> Result<Vec<Platform>> {
         if !self.platform.is_empty() {
             // User specified platforms explicitly
             return Platform::parse_multiple(&self.platform);
         }
 
-        // Default: 5 common platforms + existing in lockfile + current platform
-        let mut platforms: BTreeSet<Platform> = Platform::common_platforms().into_iter().collect();
-        platforms.insert(Platform::current());
-
-        // Add any existing platforms from lockfile (only valid ones)
-        if let Ok(lockfile) = Lockfile::read(lockfile_path) {
-            for platform_key in lockfile.all_platform_keys() {
-                if let Ok(p) = Platform::parse(&platform_key) {
-                    // Skip invalid platforms (e.g., tool-specific qualifiers like "wait-for-gh-rate-limit")
-                    if p.validate().is_ok() {
-                        platforms.insert(p);
-                    }
-                }
-            }
-        }
-
-        Ok(platforms.into_iter().collect())
+        Ok(lockfile::determine_target_platforms(lockfile_path))
     }
 
+    /// Collect tools that belong to a given lockfile pass (local or non-local).
+    /// Only includes tools whose source config matches the requested locality.
     fn get_tools_to_lock(
         &self,
         config: &Config,
         ts: &Toolset,
+        is_local: bool,
     ) -> Vec<(crate::cli::args::BackendArg, crate::toolset::ToolVersion)> {
-        // Calculate target lockfile directory (same logic as get_lockfile_path)
+        // Determine the reference lockfile directory from the first config file.
+        // Used to filter out tools from unrelated directories (e.g. global config).
         let target_lockfile_dir = config
             .config_files
             .keys()
@@ -205,11 +181,6 @@ impl Lock {
             })
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
-        // Collect tools from config files that share the same lockfile directory
-        let mut all_tools: Vec<_> = Vec::new();
-        let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
-
-        // Helper to get lockfile directory for a config path
         let get_lockfile_dir = |path: &std::path::Path| -> PathBuf {
             let (lockfile_path, _) = lockfile::lockfile_path_for_config(path);
             lockfile_path
@@ -218,14 +189,24 @@ impl Lock {
                 .unwrap_or_default()
         };
 
-        // First, get all tools from the resolved toolset (these are the "current" versions)
-        // but only if they come from a config file with the same lockfile directory
+        let mut all_tools: Vec<_> = Vec::new();
+        let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+
+        // First pass: tools from the resolved toolset whose source matches this locality
         for (backend, tv) in ts.list_current_versions() {
-            // Check if this tool's source shares the same lockfile directory
-            if let Some(source_path) = tv.request.source().path()
-                && get_lockfile_dir(source_path) != target_lockfile_dir
-            {
-                continue;
+            if let Some(source_path) = tv.request.source().path() {
+                if get_lockfile_dir(source_path) != target_lockfile_dir {
+                    continue;
+                }
+                let (_, source_is_local) = lockfile::lockfile_path_for_config(source_path);
+                if source_is_local != is_local {
+                    continue;
+                }
+            } else {
+                // Tools without a source path (env vars, CLI args) go to non-local only
+                if is_local {
+                    continue;
+                }
             }
             let key = (backend.ba().short.clone(), tv.version.clone());
             if seen.insert(key) {
@@ -233,18 +214,21 @@ impl Lock {
             }
         }
 
-        // Then, iterate config files with the same lockfile directory to find tools that may have been overridden
+        // Second pass: iterate config files matching this locality to catch
+        // tools that were overridden by a higher-priority config
         for (path, cf) in config.config_files.iter() {
-            // Skip config files that don't share the same lockfile directory
             if get_lockfile_dir(path) != target_lockfile_dir {
+                continue;
+            }
+            let (_, config_is_local) = lockfile::lockfile_path_for_config(path);
+            if config_is_local != is_local {
                 continue;
             }
             if let Ok(trs) = cf.to_tool_request_set() {
                 for (ba, requests, _source) in trs.iter() {
                     for request in requests {
-                        // Try to get a resolved version for this request
                         if let Ok(backend) = ba.backend() {
-                            // Check if we already have this tool+version in toolset
+                            // Check if the resolved toolset has a matching version
                             if let Some(resolved_tv) = ts.versions.get(ba.as_ref()) {
                                 for tv in &resolved_tv.versions {
                                     if tv.request.version() == request.version() {
@@ -255,14 +239,15 @@ impl Lock {
                                     }
                                 }
                             }
-                            // For "latest" requests, find the highest installed version
+                            // For "latest" or prefix requests not yet matched, find the
+                            // best installed version (handles overridden tools)
                             if request.version() == "latest" {
                                 let installed = backend.list_installed_versions();
                                 if let Some(latest_version) = installed.iter().max_by(|a, b| {
                                     versions::Versioning::new(a).cmp(&versions::Versioning::new(b))
                                 }) {
                                     let key = (ba.short.clone(), latest_version.clone());
-                                    if seen.insert(key.clone()) {
+                                    if seen.insert(key) {
                                         let tv = crate::toolset::ToolVersion::new(
                                             request.clone(),
                                             latest_version.clone(),
@@ -278,10 +263,8 @@ impl Lock {
         }
 
         if self.tool.is_empty() {
-            // Lock all tools
             all_tools
         } else {
-            // Filter to specified tools
             let specified: BTreeSet<String> =
                 self.tool.iter().map(|t| t.ba.short.clone()).collect();
             all_tools
@@ -329,7 +312,7 @@ impl Lock {
     ) -> Result<Vec<(String, String, bool)>> {
         let jobs = self.jobs.unwrap_or(settings.jobs);
         let semaphore = Arc::new(Semaphore::new(jobs));
-        let mut jset: JoinSet<LockTaskResult> = JoinSet::new();
+        let mut jset: JoinSet<LockResolutionResult> = JoinSet::new();
         let mut results = Vec::new();
 
         let mpr = MultiProgressReport::get();
@@ -362,60 +345,11 @@ impl Lock {
         // Spawn tasks for each tool/platform variant combination
         for (ba, tv, platform) in all_tasks {
             let semaphore = semaphore.clone();
+            let backend = crate::backend::get(&ba);
 
             jset.spawn(async move {
                 let _permit = semaphore.acquire().await;
-                let target = PlatformTarget::new(platform.clone());
-                let backend = crate::backend::get(&ba);
-
-                let (info, options, conda_packages) = if let Some(backend) = backend {
-                    let options = backend.resolve_lockfile_options(&tv.request, &target);
-                    match backend.resolve_lock_info(&tv, &target).await {
-                        Ok(info) => {
-                            // Resolve conda packages only for conda backend
-                            let conda_packages = if backend.get_type() == BackendType::Conda {
-                                let conda_backend = CondaBackend::from_arg(ba.clone());
-                                match conda_backend.resolve_conda_packages(&tv, &target).await {
-                                    Ok(packages) => packages,
-                                    Err(e) => {
-                                        warn!(
-                                            "Failed to resolve conda packages for {} on {}: {}",
-                                            ba.short,
-                                            platform.to_key(),
-                                            e
-                                        );
-                                        BTreeMap::new()
-                                    }
-                                }
-                            } else {
-                                BTreeMap::new()
-                            };
-                            (Some(info), options, conda_packages)
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to resolve {} for {}: {}",
-                                ba.short,
-                                platform.to_key(),
-                                e
-                            );
-                            (None, options, BTreeMap::new())
-                        }
-                    }
-                } else {
-                    warn!("Backend not found for {}", ba.short);
-                    (None, BTreeMap::new(), BTreeMap::new())
-                };
-
-                (
-                    ba.short.clone(),
-                    tv.version.clone(),
-                    ba.full(),
-                    platform,
-                    info,
-                    options,
-                    conda_packages,
-                )
+                lockfile::resolve_tool_lock_info(ba, tv, platform, backend).await
             });
         }
 
@@ -424,25 +358,17 @@ impl Lock {
         while let Some(result) = jset.join_next().await {
             completed += 1;
             match result {
-                Ok((short, version, backend, platform, info, options, conda_packages)) => {
-                    let platform_key = platform.to_key();
+                Ok(resolution) => {
+                    let short = resolution.0.clone();
+                    let version = resolution.1.clone();
+                    let platform_key = resolution.3.to_key();
+                    let ok = resolution.4.is_ok();
+                    if let Err(msg) = &resolution.4 {
+                        debug!("{msg}");
+                    }
                     pr.set_message(format!("{}@{} {}", short, version, platform_key));
                     pr.set_position(completed);
-                    let ok = info.is_some();
-                    if let Some(info) = info {
-                        lockfile.set_platform_info(
-                            &short,
-                            &version,
-                            Some(&backend),
-                            &options,
-                            &platform_key,
-                            info,
-                        );
-                    }
-                    // Merge conda packages into the lockfile's shared section
-                    for (basename, pkg_info) in conda_packages {
-                        lockfile.set_conda_package(&platform_key, &basename, pkg_info);
-                    }
+                    lockfile::apply_lock_result(lockfile, resolution);
                     results.push((short, platform_key, ok));
                 }
                 Err(e) => {

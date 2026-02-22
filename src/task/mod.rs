@@ -52,11 +52,13 @@ pub mod task_scheduler;
 mod task_script_parser;
 pub mod task_source_checker;
 pub mod task_sources;
+pub mod task_template;
 pub mod task_tool_installer;
 
 pub use task_load_context::{TaskLoadContext, expand_colon_task_syntax};
 pub use task_output::TaskOutput;
 pub use task_script_parser::has_any_args_defined;
+pub use task_template::TaskTemplate;
 
 use crate::config::config_file::ConfigFile;
 use crate::env_diff::EnvMap;
@@ -65,7 +67,7 @@ use crate::toolset::Toolset;
 use crate::ui::style;
 pub use deps::Deps;
 use task_dep::TaskDep;
-use task_sources::TaskOutputs;
+use task_sources::{RawOutputTemplates, TaskOutputs};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
 #[serde(untagged)]
@@ -240,6 +242,8 @@ pub struct Task {
     pub sources: Vec<String>,
     #[serde(default)]
     pub outputs: TaskOutputs,
+    #[serde(skip)]
+    pub raw_outputs: RawOutputTemplates,
     #[serde(default)]
     pub shell: Option<String>,
     #[serde(default)]
@@ -276,6 +280,10 @@ pub struct Task {
     // This is used to determine if the task should use monorepo config file context
     #[serde(skip)]
     pub remote_file_source: Option<String>,
+
+    /// Name of the task template to extend (requires experimental = true)
+    #[serde(default)]
+    pub extends: Option<String>,
 }
 
 impl Task {
@@ -303,10 +311,10 @@ impl Task {
                     "remove old syntax `# mise`"
                 );
                 if let Some(captures) =
-                    regex!(r"^(?:#|//|::)(?:MISE| ?\[MISE\]) ([a-z_]+=.+)$").captures(line)
+                    regex!(r"^(?:#|//|::)(?:MISE| ?\[MISE\]) ([a-z0-9_.-]+=[^\n]+)$").captures(line)
                 {
                     Some(captures)
-                } else if let Some(captures) = regex!(r"^(?:#|//) mise ([a-z_]+=.+)$")
+                } else if let Some(captures) = regex!(r"^(?:#|//) mise ([a-z0-9_.-]+=[^\n]+)$")
                     .captures(line)
                 {
                     deprecated!(
@@ -320,15 +328,33 @@ impl Task {
             })
             .map(|captures| captures.extract().1)
             .map(|[toml]| {
-                toml.parse::<toml::Value>()
-                    .map_err(|e| eyre::eyre!("failed to parse task header TOML '{}': {}", toml, e))
+                toml::de::from_str::<toml::Value>(toml)
+                    .map_err(|e| eyre::eyre!("failed to parse task header TOML {toml:?}: {e}"))
             })
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .filter_map(|toml| toml.as_table().cloned())
             .flatten()
             .fold(toml::Table::new(), |mut map, (key, value)| {
-                map.insert(key, value);
+                // Deep-merge tables when both existing and new values are tables
+                // This allows multiple #MISE lines like:
+                //   #MISE tools.terraform="1"
+                //   #MISE tools.tflint="0"
+                // to be merged into a single tools table
+                // See: https://github.com/jdx/mise/discussions/7839
+                if let Some(existing) = map.get_mut(&key) {
+                    if let (toml::Value::Table(existing_table), toml::Value::Table(new_table)) =
+                        (existing, &value)
+                    {
+                        for (k, v) in new_table {
+                            existing_table.insert(k.clone(), v.clone());
+                        }
+                    } else {
+                        map.insert(key, value);
+                    }
+                } else {
+                    map.insert(key, value);
+                }
                 map
             });
         let info = toml::Value::Table(info);
@@ -606,9 +632,26 @@ impl Task {
         let wait_for = self
             .wait_for
             .iter()
-            .map(|td| match_tasks_with_context(&tasks, td, Some(self)))
+            .map(|td| {
+                match_tasks_with_context(&tasks, td, Some(self))
+                    .map(|tasks| tasks.into_iter().map(|t| (t, td)).collect_vec())
+            })
             .flatten_ok()
-            .filter_ok(|t| tasks_to_run.contains(t))
+            .filter_map_ok(|(t, td)| {
+                if td.env.is_empty() && td.args.is_empty() {
+                    // Name-based matching: wait for any running instance of this task
+                    // regardless of env/args variant (e.g., "VERBOSE=1 setup" matches "setup").
+                    // Return the actual task from tasks_to_run so the dependency graph
+                    // gets the correct env/args-variant node.
+                    tasks_to_run
+                        .iter()
+                        .find(|tr| tr.name == t.name)
+                        .map(|tr| (*tr).clone())
+                } else {
+                    // Full identity matching: user explicitly wants a specific env/args variant
+                    tasks_to_run.contains(&t).then_some(t)
+                }
+            })
             .collect_vec();
         let depends_post = self
             .depends_post
@@ -852,11 +895,7 @@ impl Task {
         for a in &mut self.aliases {
             *a = tera.render_str(a, &tera_ctx)?;
         }
-        self.confirm = self
-            .confirm
-            .as_ref()
-            .map(|c| tera.render_str(c, &tera_ctx))
-            .transpose()?;
+
         self.description = tera.render_str(&self.description, &tera_ctx)?;
         for s in &mut self.sources {
             *s = tera.render_str(s, &tera_ctx)?;
@@ -864,7 +903,7 @@ impl Task {
         if !self.sources.is_empty() && self.outputs.is_empty() {
             self.outputs = TaskOutputs::Auto;
         }
-        self.outputs.render(&mut tera, &tera_ctx)?;
+        self.raw_outputs = self.outputs.render(&mut tera, &tera_ctx)?;
         for d in &mut self.depends {
             d.render(&mut tera, &tera_ctx)?;
         }
@@ -1066,10 +1105,15 @@ fn match_tasks_with_context(
                     .map(|(k, v)| EnvDirective::Val(k.clone(), v.clone(), Default::default()))
                     .collect();
                 t = t.with_dependency_env(&env_directives);
+                if let Some(config_root) = &t.config_root {
+                    let config_root = config_root.clone();
+                    t.outputs
+                        .re_render_with_env(&t.raw_outputs.clone(), &td.env, &config_root)?;
+                }
             }
-            t
+            Ok(t)
         })
-        .collect_vec();
+        .collect::<Result<Vec<_>>>()?;
     if matches.is_empty() {
         let mut err_msg = format!("task not found: {}", td.task);
 
@@ -1124,6 +1168,7 @@ impl Default for Task {
             raw: false,
             sources: vec![],
             outputs: Default::default(),
+            raw_outputs: Default::default(),
             shell: None,
             silent: Silent::Off,
             run: vec![],
@@ -1135,6 +1180,7 @@ impl Default for Task {
             usage: "".to_string(),
             timeout: None,
             remote_file_source: None,
+            extends: None,
         }
     }
 }
@@ -1289,6 +1335,7 @@ where
         // Split pattern into path and task parts
         // Pattern format: //path/...:task* or //path:task*
         let parts: Vec<&str> = normalized_pat.splitn(2, ':').collect();
+        let has_explicit_task_glob = parts.len() > 1;
         let (path_pattern, task_pattern) = match parts.as_slice() {
             [path, task] => (*path, *task),
             [path] => (*path, "*"),
@@ -1369,8 +1416,13 @@ where
                 };
 
                 // Match task part with asterisk support and extension stripping
+                // When the pattern explicitly uses a wildcard after `:` (e.g., "test:*"),
+                // require the key to actually have a task part (i.e., contain a `:`
+                // separator). This prevents "test" from matching "test:*", which would
+                // cause circular dependencies. Implicit wildcards (bare names like "test")
+                // should still match the exact task.
                 let task_matches = if task_glob == "*" {
-                    true
+                    !has_explicit_task_glob || !key_task.is_empty()
                 } else if let Some(ref matcher) = task_matcher {
                     // Check exact match OR match without extension
                     matcher.is_match(key_task) || matcher.is_match(strip_extension(key_task))
@@ -1395,7 +1447,7 @@ where
                     };
 
                     let rel_task_matches = if task_glob == "*" {
-                        true
+                        !has_explicit_task_glob || !stripped_task.is_empty()
                     } else if let Some(ref matcher) = rel_task_matcher {
                         // Check exact match OR match without extension
                         matcher.is_match(stripped_task)
@@ -2189,5 +2241,133 @@ echo "test"
             script_lines,
             parsed_fields
         );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_multi_line_tools_merge() {
+        // Regression test for https://github.com/jdx/mise/discussions/7839
+        // Multiple #MISE tools.X=Y lines should be merged into a single tools table
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir().unwrap();
+        let tasks_dir = temp_dir.path().join("tasks");
+        fs::create_dir(&tasks_dir).unwrap();
+        let task_file = tasks_dir.join("multi-tools-task");
+
+        // Create a file task with multiple tools on separate lines
+        let script_content = r#"#!/usr/bin/env bash
+#MISE tools.node="20"
+#MISE tools.python="3.11"
+#MISE tools.ruby="3.2"
+echo "test"
+"#;
+        fs::write(&task_file, script_content).unwrap();
+        fs::set_permissions(&task_file, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let config = Config::get().await.unwrap();
+        let task = Task::from_path(&config, &task_file, &tasks_dir, temp_dir.path())
+            .await
+            .unwrap();
+
+        // All three tools should be present
+        assert_eq!(
+            task.tools.len(),
+            3,
+            "Expected 3 tools, got: {:?}",
+            task.tools
+        );
+        assert!(
+            task.tools.contains_key("node"),
+            "Expected 'node' in tools: {:?}",
+            task.tools
+        );
+        assert!(
+            task.tools.contains_key("python"),
+            "Expected 'python' in tools: {:?}",
+            task.tools
+        );
+        assert!(
+            task.tools.contains_key("ruby"),
+            "Expected 'ruby' in tools: {:?}",
+            task.tools
+        );
+        assert_eq!(task.tools.get("node").unwrap(), "20");
+        assert_eq!(task.tools.get("python").unwrap(), "3.11");
+        assert_eq!(task.tools.get("ruby").unwrap(), "3.2");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_hyphenated_and_numeric_tool_names() {
+        // Test that tool names with hyphens and numbers are parsed correctly
+        // e.g., git-cliff, 1password
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir().unwrap();
+        let tasks_dir = temp_dir.path().join("tasks");
+        fs::create_dir(&tasks_dir).unwrap();
+        let task_file = tasks_dir.join("hyphenated-tools-task");
+
+        // Create a file task with hyphenated and numeric tool names
+        let script_content = r#"#!/usr/bin/env bash
+#MISE tools.git-cliff="1.0"
+#MISE tools.1password-cli="2.0"
+echo "test"
+"#;
+        fs::write(&task_file, script_content).unwrap();
+        fs::set_permissions(&task_file, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let config = Config::get().await.unwrap();
+        let task = Task::from_path(&config, &task_file, &tasks_dir, temp_dir.path())
+            .await
+            .unwrap();
+
+        // Both tools should be present
+        assert_eq!(
+            task.tools.len(),
+            2,
+            "Expected 2 tools, got: {:?}",
+            task.tools
+        );
+        assert!(
+            task.tools.contains_key("git-cliff"),
+            "Expected 'git-cliff' in tools: {:?}",
+            task.tools
+        );
+        assert!(
+            task.tools.contains_key("1password-cli"),
+            "Expected '1password-cli' in tools: {:?}",
+            task.tools
+        );
+        assert_eq!(task.tools.get("git-cliff").unwrap(), "1.0");
+        assert_eq!(task.tools.get("1password-cli").unwrap(), "2.0");
+    }
+
+    #[test]
+    fn test_get_matching_wildcard_does_not_match_parent() {
+        use std::collections::BTreeMap;
+
+        use super::GetMatchingExt;
+
+        let mut tasks: BTreeMap<String, String> = BTreeMap::new();
+        tasks.insert("test".to_string(), "test".to_string());
+        tasks.insert("test:foo".to_string(), "test:foo".to_string());
+        tasks.insert("test:bar".to_string(), "test:bar".to_string());
+
+        // "test:*" should match "test:foo" and "test:bar" but NOT "test" itself
+        let matches = tasks.get_matching("test:*").unwrap();
+        assert_eq!(
+            matches,
+            vec![&"test:bar".to_string(), &"test:foo".to_string()]
+        );
+
+        // Bare name "test" should still match the "test" task (implicit wildcard)
+        let matches = tasks.get_matching("test").unwrap();
+        assert!(matches.contains(&&"test".to_string()));
     }
 }

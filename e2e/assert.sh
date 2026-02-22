@@ -165,6 +165,16 @@ assert_matches() {
 	fi
 }
 
+assert_fail_contains() {
+	local actual
+	actual="$(quiet_assert_fail "$1")"
+	if [[ $actual == *"$2"* ]]; then
+		ok "[$1] '$2' is in failure output"
+	else
+		fail "[$1] expected '$2' to be in '$actual'"
+	fi
+}
+
 assert_fail_matches() {
 	local actual
 	actual="$(quiet_assert_fail "$1")"
@@ -222,4 +232,33 @@ require_cmd() {
 		title="E2E test $TEST_NAME aborted" err "'$1' is required but was not found in PATH"
 		exit 2
 	fi
+}
+
+# Detect platform key for lockfile tests
+# Sets: MISE_PLATFORM, MISE_PLATFORM_OS, MISE_PLATFORM_ARCH
+detect_platform() {
+	local os arch
+	os=$(uname -s)
+	arch=$(uname -m)
+	case "$os" in
+	Darwin)
+		MISE_PLATFORM_OS="macos"
+		;;
+	Linux)
+		MISE_PLATFORM_OS="linux"
+		;;
+	*)
+		MISE_PLATFORM_OS="unknown"
+		;;
+	esac
+	case "$arch" in
+	arm64 | aarch64)
+		MISE_PLATFORM_ARCH="arm64"
+		;;
+	*)
+		MISE_PLATFORM_ARCH="x64"
+		;;
+	esac
+	MISE_PLATFORM="${MISE_PLATFORM_OS}-${MISE_PLATFORM_ARCH}"
+	export MISE_PLATFORM MISE_PLATFORM_OS MISE_PLATFORM_ARCH
 }

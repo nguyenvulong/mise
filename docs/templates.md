@@ -137,6 +137,15 @@ These variables offer key information about the current environment:
 - `xdg_config_home: PathBuf` - Points to the directory of XDG config home
 - `xdg_data_home: PathBuf` - Points to the directory of XDG data home
 - `xdg_state_home: PathBuf` - Points to the directory of XDG state home
+- `tools: HashMap<String, ToolInfo | ToolInfo[]>` – Maps installed tool names to their info.
+  Available in task templates and env directives with `tools = true`.
+  - When a single version is installed:
+    - `tools.<name>.version: String` – The resolved version (e.g., `"22.1.0"`)
+    - `tools.<name>.path: String` – The install path
+  - When multiple versions are installed, it becomes an array:
+    - `tools.<name>[0].version: String` – The first version
+    - `tools.<name>[0].path: String` – The first install path
+    - `tools.<name>[1].version: String` – The second version, etc.
 
 In **task run scripts**, mise also exposes a `usage` map when the task has a usage
 specification (see [Task Arguments](/tasks/task-arguments#usage-field)):
@@ -317,9 +326,14 @@ Tera offers more filters. Read more on [tera documentation](https://keats.github
 
 #### Hash
 
-- `str | hash([len]) -> String` – Generates a SHA256 hash for the input string.
+- `str | hash([algorithm], [len]) -> String` – Generates a hash for the input string.
+  - `algorithm: "sha256" | "blake3"`: hash algorithm to use (default: `"sha256"`)
   - `len: usize`: truncates the hash string to the given size
-- `path | hash_file([len]) -> String` – Returns the SHA256 hash of the file
+  - Examples:
+    - <span v-pre>`{{ "foo" | hash }}`</span> – SHA256 hash (default)
+    - <span v-pre>`{{ "foo" | hash(algorithm="blake3") }}`</span> – BLAKE3 hash
+    - <span v-pre>`{{ "foo" | hash(len=8) }}`</span> – SHA256 hash truncated to 8 characters
+- `path | hash_file([len]) -> String` – Returns the BLAKE3 hash of the file
   at the given path.
   - `len: usize`: truncates the hash string to the given size
 

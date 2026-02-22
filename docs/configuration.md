@@ -286,7 +286,7 @@ experimental_monorepo_root = true
 When enabled:
 
 - Tasks in subdirectories are available with namespaced paths (e.g., `//projects/frontend:build`)
-- Subdirectory tasks inherit tools from parent configs
+- Subdirectory tasks use tools from parent configs
 - Tasks are only loaded when needed (e.g., when running them, or with `mise tasks ls --all`)
 - All descendant config files are **implicitly trusted** when the root is trusted
 - Eliminates the need to individually trust each subdirectory's configuration
@@ -338,7 +338,7 @@ raw = false           # set to true to directly pipe plugins to stdin/stdout/std
 yes = false           # set to true to automatically answer yes to all prompts
 
 not_found_auto_install = true # see MISE_NOT_FOUND_AUTO_INSTALL
-task_output = "prefix" # see Tasks Runner for more information
+task.output = "prefix" # see Tasks Runner for more information
 paranoid = false       # see MISE_PARANOID
 
 shorthands_file = '~/.config/mise/shorthands.toml' # path to the shorthands file, see `MISE_SHORTHANDS_FILE`
@@ -350,7 +350,11 @@ env_file = '.env' # load env vars from a dotenv file, see `MISE_ENV_FILE`
 experimental = true # enable experimental features
 
 # configure messages displayed when entering directories with config files
-status = { missing_tools = "if_other_versions_installed", show_env = false, show_tools = false }
+status = {
+  missing_tools = "if_other_versions_installed",
+  show_env = false,
+  show_tools = false,
+}
 
 # "_" is a special key for information you'd like to put into mise.toml that mise will never parse
 [_]

@@ -1,22 +1,32 @@
 use crate::Result;
+use crate::config::Config;
 use crate::config::env_directive::EnvResults;
 use crate::dirs;
+use crate::plugins::Plugin;
 use crate::plugins::vfox_plugin::VfoxPlugin;
+use crate::ui::multi_progress_report::MultiProgressReport;
 use heck::ToKebabCase;
+use indexmap::IndexMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use toml::Value;
 
 impl EnvResults {
     pub async fn module(
         r: &mut EnvResults,
+        config: &Arc<Config>,
         source: PathBuf,
         name: String,
         value: &Value,
-        redact: bool,
+        redact: Option<bool>,
+        env: IndexMap<String, String>,
     ) -> Result<()> {
         let path = dirs::PLUGINS.join(name.to_kebab_case());
         let plugin = VfoxPlugin::new(name, path.clone());
-        if let Some(response) = plugin.mise_env(value).await? {
+        plugin
+            .ensure_installed(config, &MultiProgressReport::get(), false, false)
+            .await?;
+        if let Some(response) = plugin.mise_env(value, &env).await? {
             // Track cacheability
             if !response.cacheable {
                 r.has_uncacheable = true;
@@ -39,14 +49,16 @@ impl EnvResults {
             }
 
             // Add env vars
+            // User's explicit redact setting takes priority, otherwise use plugin's preference
+            let should_redact = redact.unwrap_or(response.redact);
             for (k, v) in response.env {
-                if redact {
+                if should_redact {
                     r.redactions.push(k.clone());
                 }
                 r.env.insert(k, (v, source.clone()));
             }
         }
-        if let Some(path) = plugin.mise_path(value).await? {
+        if let Some(path) = plugin.mise_path(value, &env).await? {
             for p in path {
                 r.env_paths.push(p.into());
             }

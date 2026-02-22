@@ -13,6 +13,7 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 use tera::Context as TeraContext;
+use tera::Value as TeraValue;
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Key, Value, table, value};
 use versions::Versioning;
 
@@ -24,11 +25,11 @@ use crate::config::settings::SettingsPartial;
 use crate::config::{Alias, AliasMap, Config};
 use crate::env_diff::EnvMap;
 use crate::file::{create_dir_all, display_path};
-use crate::hooks::{Hook, Hooks};
+use crate::hooks::{Hook, HookDef, Hooks};
 use crate::prepare::PrepareConfig;
 use crate::redactions::Redactions;
 use crate::registry::REGISTRY;
-use crate::task::Task;
+use crate::task::{Task, TaskTemplate};
 use crate::tera::{BASE_CONTEXT, get_tera};
 use crate::toolset::{ToolRequest, ToolRequestSet, ToolSource, ToolVersionOptions};
 use crate::watch_files::WatchFile;
@@ -62,7 +63,7 @@ pub struct MiseToml {
     #[serde(skip)]
     doc: Mutex<OnceCell<DocumentMut>>,
     #[serde(default)]
-    hooks: IndexMap<Hooks, toml::Value>,
+    hooks: IndexMap<Hooks, HookDef>,
     #[serde(default)]
     tools: Mutex<IndexMap<BackendArg, MiseTomlToolList>>,
     #[serde(default)]
@@ -73,6 +74,8 @@ pub struct MiseToml {
     task_config: TaskConfig,
     #[serde(default)]
     tasks: Tasks,
+    #[serde(default)]
+    task_templates: TaskTemplates,
     #[serde(default)]
     watch_files: Vec<WatchFile>,
     #[serde(default)]
@@ -100,6 +103,9 @@ pub struct MiseTomlTool {
 
 #[derive(Debug, Default, Clone)]
 pub struct Tasks(pub BTreeMap<String, Task>);
+
+#[derive(Debug, Default, Clone)]
+pub struct TaskTemplates(pub IndexMap<String, TaskTemplate>);
 
 #[derive(Debug, Default, Clone)]
 pub struct EnvList(pub(crate) Vec<EnvDirective>);
@@ -175,7 +181,7 @@ impl MiseToml {
     pub fn from_str(body: &str, path: &Path) -> eyre::Result<Self> {
         trust_check(path)?;
         trace!("parsing: {}", display_path(path));
-        let des = toml::Deserializer::new(body);
+        let des = toml::Deserializer::parse(body).map_err(|e| toml_parse_error(&e, body, path))?;
         let de_res = serde_ignored::deserialize(des, |p| {
             warn!("unknown field in {}: {p}", display_path(path));
         });
@@ -508,6 +514,10 @@ impl ConfigFile for MiseToml {
         self.tasks.0.values().collect()
     }
 
+    fn task_templates(&self) -> IndexMap<String, TaskTemplate> {
+        self.task_templates.0.clone()
+    }
+
     fn remove_tool(&self, fa: &BackendArg) -> eyre::Result<()> {
         let mut tools = self.tools.lock().unwrap();
         tools.shift_remove(fa);
@@ -638,6 +648,29 @@ impl ConfigFile for MiseToml {
         let mut trs = ToolRequestSet::new();
         let tools = self.tools.lock().unwrap();
         let mut context = self.context.clone();
+        if let Some(config) = Config::maybe_get()
+            && let Some(env_results) = config.env_results_cached()
+        {
+            let mut env_vars: EnvMap =
+                if let Some(TeraValue::Object(existing_env)) = context.get("env") {
+                    existing_env
+                        .iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect()
+                } else {
+                    env::PRISTINE_ENV.clone()
+                };
+            for key in &env_results.env_remove {
+                env_vars.remove(key);
+            }
+            env_vars.extend(
+                env_results
+                    .env
+                    .iter()
+                    .map(|(k, (v, _))| (k.clone(), v.clone())),
+            );
+            context.insert("env", &env_vars);
+        }
         if context.get("vars").is_none()
             && let Some(config) = Config::maybe_get()
         {
@@ -682,6 +715,28 @@ impl ConfigFile for MiseToml {
                         });
                     }
                     ba_opts.merge(&options.opts);
+                    // Re-apply registry defaults for install-time keys not overridden by user.
+                    // The filtering above strips both stale install-state cache AND registry
+                    // defaults. We want to keep registry defaults while discarding stale cache.
+                    if let Some(rt) = crate::registry::REGISTRY.get(ba.short.as_str()) {
+                        let full = ba.full();
+                        // Get structured options from registry (table-format backends)
+                        let mut registry_opts = rt.backend_options(&full);
+                        // Also parse inline options from [key=val,...] in the full string
+                        if let Some(start) = full.rfind('[')
+                            && full.ends_with(']')
+                        {
+                            let inline = crate::toolset::parse_tool_options(
+                                &full[start + 1..full.len() - 1],
+                            );
+                            for (k, v) in inline.opts {
+                                registry_opts.opts.entry(k).or_insert(v);
+                            }
+                        }
+                        for (k, v) in registry_opts.opts {
+                            ba_opts.opts.entry(k).or_insert(v);
+                        }
+                    }
                     // Copy os and install_env from config (not cached)
                     ba_opts.os = options.os.clone();
                     ba_opts.install_env = options.install_env.clone();
@@ -781,8 +836,8 @@ impl ConfigFile for MiseToml {
         Ok(self
             .hooks
             .iter()
-            .map(|(hook, val)| {
-                let mut hooks = Hook::from_toml(*hook, val.clone())?;
+            .map(|(hook_type, def)| {
+                let mut hooks = def.clone().into_hooks(*hook_type);
                 for hook in hooks.iter_mut() {
                     hook.script = self.parse_template(&hook.script)?;
                     if let Some(shell) = &hook.shell {
@@ -865,6 +920,7 @@ impl Clone for MiseToml {
             redactions: self.redactions.clone(),
             plugins: self.plugins.clone(),
             tasks: self.tasks.clone(),
+            task_templates: self.task_templates.clone(),
             task_config: self.task_config.clone(),
             settings: self.settings.clone(),
             watch_files: self.watch_files.clone(),
@@ -1253,8 +1309,14 @@ impl<'de> de::Deserialize<'de> for EnvList {
                             env.extend(flatten_directives(directives.path, EnvDirective::Path));
                             env.extend(flatten_directives(directives.file, EnvDirective::File));
                             env.extend(flatten_directives(directives.source, EnvDirective::Source));
-                            for (key, value) in directives.other {
-                                env.push(EnvDirective::Module(key, value, Default::default()));
+                            for (key, mut value) in directives.other {
+                                let mut opts = EnvDirectiveOptions::default();
+                                if let Some(table) = value.as_table_mut()
+                                    && let Some(tools) = table.remove("tools")
+                                {
+                                    opts.tools = tools.as_bool().unwrap_or(false);
+                                }
+                                env.push(EnvDirective::Module(key, value, opts));
                             }
                             if let Some(venv) = directives.python.venv {
                                 env.push(EnvDirective::PythonVenv {
@@ -1717,6 +1779,36 @@ impl<'de> de::Deserialize<'de> for Tasks {
     }
 }
 
+impl<'de> de::Deserialize<'de> for TaskTemplates {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        struct TaskTemplatesVisitor;
+
+        impl<'de> Visitor<'de> for TaskTemplatesVisitor {
+            type Value = TaskTemplates;
+            fn expecting(&self, formatter: &mut Formatter) -> std::fmt::Result {
+                formatter.write_str("map of task template names to template definitions")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> std::result::Result<Self::Value, M::Error>
+            where
+                M: de::MapAccess<'de>,
+            {
+                let mut templates = IndexMap::new();
+                while let Some(name) = map.next_key::<String>()? {
+                    let template: TaskTemplate = map.next_value()?;
+                    templates.insert(name, template);
+                }
+                Ok(TaskTemplates(templates))
+            }
+        }
+
+        deserializer.deserialize_any(TaskTemplatesVisitor)
+    }
+}
+
 impl<'de> de::Deserialize<'de> for BackendArg {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
@@ -1819,6 +1911,7 @@ mod tests {
     use test_log::test;
 
     use crate::dirs;
+    use crate::file;
     use crate::test::replace_path;
     use crate::toolset::ToolRequest;
     use crate::{config::Config, dirs::CWD};
@@ -1891,6 +1984,40 @@ mod tests {
             "{:#?}",
             cf.to_tool_request_set().unwrap().tools
         )));
+    }
+
+    #[tokio::test]
+    async fn test_env_source_var_in_tool() {
+        let cwd = CWD.as_ref().unwrap();
+        let script = cwd.join("set-go-version.sh");
+        let config_file = cwd.join(".test.mise.toml");
+
+        file::write(&script, "export MY_GO_VERSION=\"1.2.3\"\n").unwrap();
+        file::write(
+            &config_file,
+            r#"
+        [env]
+        _.source = "./set-go-version.sh"
+
+        [tools]
+        go = "{{env.MY_GO_VERSION}}"
+        "#,
+        )
+        .unwrap();
+
+        let config = Config::reset().await.unwrap();
+        let trs = config.get_tool_request_set().await.unwrap();
+        let go_req = trs
+            .tools
+            .iter()
+            .find(|(ba, _)| ba.short == "go")
+            .and_then(|(_, reqs)| reqs.first())
+            .unwrap();
+
+        assert_eq!(go_req.version(), "1.2.3");
+
+        file::remove_file(&config_file).unwrap();
+        file::remove_file(&script).unwrap();
     }
 
     #[tokio::test]
@@ -2188,5 +2315,59 @@ mod tests {
 
     fn parse_env(toml: String) -> String {
         parse(toml).env_entries().unwrap().into_iter().join("\n")
+    }
+
+    #[tokio::test]
+    async fn test_table_syntax_preserves_registry_defaults() {
+        // Test for #8039: table syntax like `ansible = { version = "latest" }`
+        // should preserve registry defaults (e.g. uvx=false, pipx_args=--include-deps)
+        let _config = Config::get().await.unwrap();
+        let cf = parse(formatdoc! {r#"
+            [tools]
+            ansible = {{ version = "latest" }}
+        "#});
+        let trs = cf.to_tool_request_set().unwrap();
+        let tools = trs.tools;
+        // Find the ansible tool request
+        let ansible_requests = tools
+            .iter()
+            .find(|(ba, _)| ba.short == "ansible")
+            .map(|(_, reqs)| reqs)
+            .expect("ansible should be in tool request set");
+        let opts = ansible_requests[0].options();
+        assert_eq!(
+            opts.get("uvx").map(|s| s.as_str()),
+            Some("false"),
+            "registry default uvx=false should be preserved with table syntax"
+        );
+        assert_eq!(
+            opts.get("pipx_args").map(|s| s.as_str()),
+            Some("--include-deps"),
+            "registry default pipx_args=--include-deps should be preserved with table syntax"
+        );
+
+        // Also verify that user-provided options override registry defaults
+        let cf2 = parse(formatdoc! {r#"
+            [tools]
+            ansible = {{ version = "latest", uvx = "true" }}
+        "#});
+        let trs2 = cf2.to_tool_request_set().unwrap();
+        let ansible2 = trs2
+            .tools
+            .iter()
+            .find(|(ba, _)| ba.short == "ansible")
+            .map(|(_, reqs)| reqs)
+            .expect("ansible should be in tool request set");
+        let opts2 = ansible2[0].options();
+        assert_eq!(
+            opts2.get("uvx").map(|s| s.as_str()),
+            Some("true"),
+            "user-provided uvx=true should override registry default uvx=false"
+        );
+        assert_eq!(
+            opts2.get("pipx_args").map(|s| s.as_str()),
+            Some("--include-deps"),
+            "non-overridden registry default pipx_args should still be preserved"
+        );
     }
 }

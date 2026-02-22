@@ -66,8 +66,13 @@ impl PrepareCommand {
 
 /// Trait for prepare providers that can check and install dependencies
 pub trait PrepareProvider: Debug + Send + Sync {
+    /// Access the shared base (project root + config)
+    fn base(&self) -> &providers::ProviderBase;
+
     /// Unique identifier for this provider (e.g., "npm", "cargo", "codegen")
-    fn id(&self) -> &str;
+    fn id(&self) -> &str {
+        &self.base().id
+    }
 
     /// Returns the source files to check for freshness (lock files, config files)
     fn sources(&self) -> Vec<PathBuf>;
@@ -83,7 +88,12 @@ pub trait PrepareProvider: Debug + Send + Sync {
 
     /// Whether this provider should auto-run before mise x/run
     fn is_auto(&self) -> bool {
-        false
+        self.base().is_auto()
+    }
+
+    /// Whether to update mtime of output files/dirs after a successful run
+    fn touch_outputs(&self) -> bool {
+        self.base().touch_outputs()
     }
 }
 
@@ -99,7 +109,7 @@ pub fn notify_if_stale(config: &Arc<Config>) {
         return;
     }
 
-    let Ok(engine) = PrepareEngine::new(config.clone()) else {
+    let Ok(engine) = PrepareEngine::new(config) else {
         return;
     };
 
@@ -135,4 +145,91 @@ pub fn clear_output_stale(path: &PathBuf) {
     if let Ok(mut set) = STALE_OUTPUTS.lock() {
         set.remove(path);
     }
+}
+
+/// Detect which built-in prepare providers are applicable for a given directory
+///
+/// This checks if the lockfiles/config files for each provider exist.
+pub fn detect_applicable_providers(project_root: &Path) -> Vec<String> {
+    use providers::*;
+    use rule::PrepareProviderConfig;
+
+    let default_config = PrepareProviderConfig::default();
+    let mut applicable = Vec::new();
+
+    // Check each built-in provider
+    let checks: &[(&str, Box<dyn PrepareProvider>)] = &[
+        (
+            "npm",
+            Box::new(NpmPrepareProvider::new(
+                project_root,
+                default_config.clone(),
+            )),
+        ),
+        (
+            "yarn",
+            Box::new(YarnPrepareProvider::new(
+                project_root,
+                default_config.clone(),
+            )),
+        ),
+        (
+            "pnpm",
+            Box::new(PnpmPrepareProvider::new(
+                project_root,
+                default_config.clone(),
+            )),
+        ),
+        (
+            "bun",
+            Box::new(BunPrepareProvider::new(
+                project_root,
+                default_config.clone(),
+            )),
+        ),
+        (
+            "go",
+            Box::new(GoPrepareProvider::new(project_root, default_config.clone())),
+        ),
+        (
+            "pip",
+            Box::new(PipPrepareProvider::new(
+                project_root,
+                default_config.clone(),
+            )),
+        ),
+        (
+            "poetry",
+            Box::new(PoetryPrepareProvider::new(
+                project_root,
+                default_config.clone(),
+            )),
+        ),
+        (
+            "uv",
+            Box::new(UvPrepareProvider::new(project_root, default_config.clone())),
+        ),
+        (
+            "bundler",
+            Box::new(BundlerPrepareProvider::new(
+                project_root,
+                default_config.clone(),
+            )),
+        ),
+        (
+            "composer",
+            Box::new(ComposerPrepareProvider::new(
+                project_root,
+                default_config.clone(),
+            )),
+        ),
+    ];
+
+    for (name, provider) in checks {
+        if provider.is_applicable() {
+            applicable.push(name.to_string());
+        }
+    }
+
+    applicable
 }

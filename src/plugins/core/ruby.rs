@@ -387,10 +387,16 @@ impl RubyPlugin {
     // ===== Precompiled Ruby support =====
 
     /// Check if precompiled binaries should be tried
-    /// Requires experimental=true and compile not explicitly set to true
+    /// Precompiled if: explicit opt-in (compile=false), or experimental + not opted out
+    /// TODO(2026.8.0): make precompiled the default when compile is unset, remove this debug_assert
     fn should_try_precompiled(&self) -> bool {
+        debug_assert!(
+            *crate::cli::version::V < versions::Versioning::new("2026.8.0").unwrap(),
+            "precompiled ruby should be the default now, update should_try_precompiled()"
+        );
         let settings = Settings::get();
-        settings.experimental && settings.ruby.compile != Some(true)
+        settings.ruby.compile == Some(false)
+            || (settings.experimental && settings.ruby.compile.is_none())
     }
 
     /// Get platform identifier for precompiled binaries
@@ -460,24 +466,58 @@ impl RubyPlugin {
             .replace("{arch}", arch)
     }
 
-    /// Find precompiled asset from a GitHub repo's releases
+    /// Check if the system needs the no-YJIT variant (glibc < 2.35 on Linux).
+    /// YJIT builds from jdx/ruby require glibc 2.35+.
+    fn needs_no_yjit() -> bool {
+        match *crate::env::LINUX_GLIBC_VERSION {
+            Some((major, minor)) => major < 2 || (major == 2 && minor < 35),
+            None => false, // non-Linux or can't detect, assume modern system
+        }
+    }
+
+    /// Find precompiled asset from a GitHub repo's releases.
+    /// On Linux with glibc < 2.35, prefers the no-YJIT variant (.no_yjit.) which
+    /// targets glibc 2.17. Falls back to the standard build if no variant is found.
     async fn find_precompiled_asset_in_repo(
         &self,
         repo: &str,
         version: &str,
         platform: &str,
+        prefer_no_yjit: bool,
     ) -> Result<Option<(String, Option<String>)>> {
         let releases = github::list_releases(repo).await?;
-        let expected_name = format!("ruby-{}.{}.tar.gz", version, platform);
+        let standard_name = format!("ruby-{}.{}.tar.gz", version, platform);
+        let no_yjit_name = format!("ruby-{}.{}.no_yjit.tar.gz", version, platform);
 
-        for release in releases {
-            for asset in release.assets {
-                if asset.name == expected_name {
-                    return Ok(Some((asset.browser_download_url, asset.digest)));
+        if prefer_no_yjit {
+            debug!("glibc < 2.35 detected, preferring no-YJIT Ruby variant");
+        }
+
+        let mut standard_asset = None;
+        let mut no_yjit_asset = None;
+
+        for release in &releases {
+            for asset in &release.assets {
+                if no_yjit_asset.is_none() && asset.name == no_yjit_name {
+                    no_yjit_asset =
+                        Some((asset.browser_download_url.clone(), asset.digest.clone()));
+                } else if standard_asset.is_none() && asset.name == standard_name {
+                    standard_asset =
+                        Some((asset.browser_download_url.clone(), asset.digest.clone()));
                 }
             }
+            if no_yjit_asset.is_some() && standard_asset.is_some() {
+                break;
+            }
         }
-        Ok(None)
+
+        if prefer_no_yjit {
+            if no_yjit_asset.is_some() {
+                return Ok(no_yjit_asset);
+            }
+            debug!("no-YJIT variant not found, falling back to standard build");
+        }
+        Ok(standard_asset)
     }
 
     /// Resolve precompiled binary URL and checksum for a given version and platform
@@ -485,6 +525,7 @@ impl RubyPlugin {
         &self,
         version: &str,
         platform: &str,
+        prefer_no_yjit: bool,
     ) -> Result<Option<(String, Option<String>)>> {
         let settings = Settings::get();
         let source = &settings.ruby.precompiled_url;
@@ -497,7 +538,7 @@ impl RubyPlugin {
             )))
         } else {
             // GitHub repo shorthand (default: "jdx/ruby")
-            self.find_precompiled_asset_in_repo(source, version, platform)
+            self.find_precompiled_asset_in_repo(source, version, platform, prefer_no_yjit)
                 .await
         }
     }
@@ -551,12 +592,17 @@ impl RubyPlugin {
             return Ok(None);
         };
 
-        let Some((url, checksum)) = self.resolve_precompiled_url(&tv.version, &platform).await?
+        let Some((url, checksum)) = self
+            .resolve_precompiled_url(&tv.version, &platform, Self::needs_no_yjit())
+            .await?
         else {
             return Ok(None);
         };
 
-        let filename = format!("ruby-{}.{}.tar.gz", tv.version, platform);
+        let filename = match url.rsplit('/').next() {
+            Some(name) if !name.is_empty() => name.to_string(),
+            _ => format!("ruby-{}.{}.tar.gz", tv.version, platform),
+        };
         let tarball_path = tv.download_path().join(&filename);
 
         ctx.pr.set_message(format!("download {}", filename));
@@ -678,10 +724,7 @@ impl Backend for RubyPlugin {
             .ruby
             .github_attestations
             .unwrap_or(settings.github_attestations);
-        if settings.experimental
-            && settings.ruby.compile != Some(true)
-            && github_attestations_enabled
-        {
+        if self.should_try_precompiled() && github_attestations_enabled {
             features.push(SecurityFeature::GithubAttestations {
                 signer_workflow: None,
             });
@@ -751,7 +794,16 @@ impl Backend for RubyPlugin {
     }
 
     async fn install_version_(&self, ctx: &InstallContext, tv: ToolVersion) -> Result<ToolVersion> {
-        // Try precompiled if experimental mode is enabled and compile is not explicitly true
+        let settings = Settings::get();
+        if settings.ruby.compile.is_none() && !settings.experimental {
+            warn_once!(
+                "precompiled ruby will be the default in 2026.8.0.\n\
+                 To use precompiled binaries now: mise settings ruby.compile=false\n\
+                 To keep compiling from source: mise settings ruby.compile=true"
+            );
+        }
+
+        // Try precompiled if compile=false or experimental + not opted out
         if self.should_try_precompiled()
             && let Some(installed_tv) = self.install_precompiled(ctx, &tv).await?
         {
@@ -833,8 +885,9 @@ impl Backend for RubyPlugin {
         // Precompiled binary info if enabled
         if self.should_try_precompiled()
             && let Some(platform) = self.precompiled_platform_for_target(target)
-            && let Some((url, checksum)) =
-                self.resolve_precompiled_url(&tv.version, &platform).await?
+            && let Some((url, checksum)) = self
+                .resolve_precompiled_url(&tv.version, &platform, false)
+                .await?
         {
             return Ok(PlatformInfo {
                 url: Some(url),

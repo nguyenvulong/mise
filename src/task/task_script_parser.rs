@@ -1,4 +1,3 @@
-use crate::cli::version::V;
 use crate::config::{Config, Settings};
 use crate::env_diff::EnvMap;
 use crate::exit::exit;
@@ -12,7 +11,6 @@ use std::collections::{HashMap, HashSet};
 use std::iter::once;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use versions::Versioning;
 
 type TeraSpecParsingResult = (
     tera::Tera,
@@ -62,27 +60,14 @@ impl TaskScriptParser {
             return;
         }
 
-        // Debug assertion to ensure we remove this functionality after 2026.11.0
-        let removal_version = Versioning::new("2026.11.0").unwrap();
-        debug_assert!(
-            *V < removal_version,
-            "Tera template task arguments (arg/option/flag functions) should have been removed in version 2026.11.0. \
-             Please remove this deprecated functionality from task_script_parser.rs"
+        deprecated_at!(
+            "2026.5.0",
+            "2027.5.0",
+            "tera_template_task_args",
+            "Task '{}' uses deprecated Tera template functions (arg(), option(), flag()) in run scripts. \
+             Use the 'usage' field instead. See https://mise.jdx.dev/tasks/task-arguments.html",
+            task_name
         );
-
-        // Show deprecation warning for versions >= 2026.5.0
-        let deprecation_version = Versioning::new("2026.5.0").unwrap();
-        if *V >= deprecation_version {
-            deprecated!(
-                "tera_template_task_args",
-                "Task '{}' uses deprecated Tera template functions (arg(), option(), flag()) in run scripts. \
-                 This will be removed in mise 2026.11.0. The template functions require two-pass parsing which \
-                 causes unexpected behavior - they return empty strings during spec collection and have complex \
-                 escaping rules. The 'usage' field is cleaner, works consistently between TOML/file tasks, and \
-                 provides all the same functionality. See migration guide: https://mise.jdx.dev/tasks/task-arguments/#tera-templates",
-                task_name
-            );
-        }
     }
 
     // Helper functions for tera error handling
@@ -588,9 +573,10 @@ impl TaskScriptParser {
 
         // Don't insert env for spec-only parsing to avoid expensive environment rendering
         // Render scripts to trigger spec collection via Tera template functions
-        // (arg/option/flag), but discard the results
+        // (arg/option/flag), but discard the results. Ignore rendering errors since we only
+        // care about collecting arg/flag definitions from the deprecated Tera syntax.
         for script in scripts {
-            Self::render_script_with_context(&mut tera, script, &tera_ctx)?;
+            let _ = Self::render_script_with_context(&mut tera, script, &tera_ctx);
         }
         let mut cmd = usage::SpecCommand::default();
         // TODO: ensure no gaps in args, e.g.: 1,2,3,4,5
@@ -682,7 +668,11 @@ impl TaskScriptParser {
             .into_iter()
             .chain(args.iter().cloned())
             .collect::<Vec<_>>();
-        let m = match usage::parse(spec, &args) {
+        // Pass env vars to Parser so it can resolve env= defaults in usage specs
+        // This is needed for monorepo tasks where child config env vars aren't in the process env
+        let env_map: std::collections::HashMap<String, String> =
+            env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let m = match usage::Parser::new(spec).with_env(env_map).parse(&args) {
             Ok(m) => m,
             Err(e) => {
                 // just print exactly what usage returns so the error output isn't double-wrapped
@@ -813,7 +803,7 @@ impl TaskScriptParser {
     ///   - Count flags (`count = true`) use a `Vec<bool>` whose length is
     ///     derived from the default (parsed as a usize) or an empty array.
     ///   - Simple flags use `false`.
-    fn make_usage_ctx_from_spec_defaults(spec: &usage::Spec) -> HashMap<String, tera::Value> {
+    pub fn make_usage_ctx_from_spec_defaults(spec: &usage::Spec) -> HashMap<String, tera::Value> {
         let mut usage_ctx: HashMap<String, tera::Value> = HashMap::new();
 
         // Args

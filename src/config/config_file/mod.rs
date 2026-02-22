@@ -19,7 +19,7 @@ use crate::hash::hash_to_str;
 use crate::hooks::Hook;
 use crate::prepare::PrepareConfig;
 use crate::redactions::Redactions;
-use crate::task::Task;
+use crate::task::{Task, TaskTemplate};
 use crate::toolset::{ToolRequest, ToolRequestSet, ToolSource, ToolVersionList, Toolset};
 use crate::ui::{prompt, style};
 use crate::watch_files::WatchFile;
@@ -108,6 +108,10 @@ pub trait ConfigFile: Debug + Send + Sync {
     fn task_config(&self) -> &TaskConfig {
         static DEFAULT_TASK_CONFIG: Lazy<TaskConfig> = Lazy::new(TaskConfig::default);
         &DEFAULT_TASK_CONFIG
+    }
+
+    fn task_templates(&self) -> IndexMap<String, TaskTemplate> {
+        IndexMap::new()
     }
 
     fn experimental_monorepo_root(&self) -> Option<bool> {
@@ -296,11 +300,12 @@ pub fn trust_check(path: &Path) -> eyre::Result<()> {
         return Ok(());
     }
     if cmd != "hook-env" && !is_ignored(&config_root) && !is_ignored(path) {
-        let ans = prompt::confirm_with_all(format!(
-            "{} config files in {} are not trusted. Trust them?",
-            style::eyellow("mise"),
-            style::epath(&config_root)
-        ))?;
+        let ans = (settings::is_loaded() && Settings::get().yes)
+            || prompt::confirm_with_all(format!(
+                "{} config files in {} are not trusted. Trust them?",
+                style::eyellow("mise"),
+                style::epath(&config_root)
+            ))?;
         if ans {
             trust(&config_root)?;
             return Ok(());

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::iter::once;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use heck::{
     ToKebabCase, ToLowerCamelCase, ToShoutyKebabCase, ToShoutySnakeCase, ToSnakeCase,
@@ -17,6 +18,28 @@ use crate::cmd::cmd;
 use crate::config::Settings;
 use crate::env_diff::EnvMap;
 use crate::{dirs, duration, env, hash};
+
+/// Global tracker for files accessed during tera template rendering.
+/// Functions like `read_file`, `hash_file`, `file_size`, and `last_modified`
+/// push paths here so that hook-env can watch them for changes.
+static TERA_ACCESSED_FILES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+fn track_tera_file(path: &Path) {
+    if let Ok(mut files) = TERA_ACCESSED_FILES.lock() {
+        files.push(path.to_path_buf());
+    }
+}
+
+/// Take all tracked files, clearing the global list.
+pub fn take_tera_accessed_files() -> Vec<PathBuf> {
+    let mut files = TERA_ACCESSED_FILES
+        .lock()
+        .map(|mut f| std::mem::take(&mut *f))
+        .unwrap_or_default();
+    files.sort();
+    files.dedup();
+    files
+}
 
 pub static BASE_CONTEXT: Lazy<Context> = Lazy::new(|| {
     let mut context = Context::new();
@@ -40,7 +63,7 @@ static TERA: Lazy<Tera> = Lazy::new(|| {
     let mut tera = Tera::default();
     tera.register_function(
         "arch",
-        move |_args: &HashMap<String, Value>| -> tera::Result<Value> {
+        move |args: &HashMap<String, Value>| -> tera::Result<Value> {
             let arch = if cfg!(target_arch = "x86_64") {
                 "x64"
             } else if cfg!(target_arch = "aarch64") {
@@ -48,6 +71,12 @@ static TERA: Lazy<Tera> = Lazy::new(|| {
             } else {
                 env::consts::ARCH
             };
+            // Check if there's a remap for this arch
+            if let Some(remapped) = args.get(arch)
+                && let Some(s) = remapped.as_str()
+            {
+                return Ok(Value::String(s.to_string()));
+            }
             Ok(Value::String(arch.to_string()))
         },
     );
@@ -60,8 +89,15 @@ static TERA: Lazy<Tera> = Lazy::new(|| {
     );
     tera.register_function(
         "os",
-        move |_args: &HashMap<String, Value>| -> tera::Result<Value> {
-            Ok(Value::String(env::consts::OS.to_string()))
+        move |args: &HashMap<String, Value>| -> tera::Result<Value> {
+            let os = env::consts::OS;
+            // Check if there's a remap for this OS
+            if let Some(remapped) = args.get(os)
+                && let Some(s) = remapped.as_str()
+            {
+                return Ok(Value::String(s.to_string()));
+            }
+            Ok(Value::String(os.to_string()))
         },
     );
     tera.register_function(
@@ -116,6 +152,7 @@ static TERA: Lazy<Tera> = Lazy::new(|| {
         move |input: &Value, args: &HashMap<String, Value>| match input {
             Value::String(s) => {
                 let path = Path::new(s);
+                track_tera_file(path);
                 let mut hash = hash::file_hash_blake3(path, None).unwrap();
                 if let Some(len) = args.get("len").and_then(Value::as_u64) {
                     hash = hash.chars().take(len as usize).collect();
@@ -129,7 +166,18 @@ static TERA: Lazy<Tera> = Lazy::new(|| {
         "hash",
         move |input: &Value, args: &HashMap<String, Value>| match input {
             Value::String(s) => {
-                let mut hash = hash::hash_blake3_to_str(s);
+                // Get the algorithm, default to sha256
+                let algorithm = args
+                    .get("algorithm")
+                    .and_then(Value::as_str)
+                    .unwrap_or("sha256");
+
+                let mut hash = match algorithm {
+                    "sha256" => hash::hash_sha256_to_str(s),
+                    "blake3" => hash::hash_blake3_to_str(s),
+                    _ => return Err(format!("unknown hash algorithm: {algorithm}").into()),
+                };
+
                 if let Some(len) = args.get("len").and_then(Value::as_u64) {
                     hash = hash.chars().take(len as usize).collect();
                 }
@@ -206,6 +254,7 @@ static TERA: Lazy<Tera> = Lazy::new(|| {
         move |input: &Value, _args: &HashMap<String, Value>| match input {
             Value::String(s) => {
                 let p = Path::new(s);
+                track_tera_file(p);
                 let metadata = p.metadata()?;
                 let size = metadata.len();
                 Ok(Value::Number(size.into()))
@@ -218,6 +267,7 @@ static TERA: Lazy<Tera> = Lazy::new(|| {
         move |input: &Value, _args: &HashMap<String, Value>| match input {
             Value::String(s) => {
                 let p = Path::new(s);
+                track_tera_file(p);
                 let metadata = p.metadata()?;
                 let modified = metadata.modified()?;
                 let modified = modified.duration_since(std::time::UNIX_EPOCH).unwrap();
@@ -421,6 +471,7 @@ pub fn tera_read_file(
                     PathBuf::from(path_str)
                 };
 
+                track_tera_file(&path);
                 match std::fs::read_to_string(&path) {
                     Ok(contents) => Ok(Value::String(contents)),
                     Err(e) => {
@@ -629,7 +680,14 @@ mod tests {
     #[tokio::test]
     async fn test_hash() {
         let _config = Config::get().await.unwrap();
+        // SHA256 of "foo" is 2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae
         let s = render("{{ \"foo\" | hash(len=8) }}");
+        assert_eq!(s, "2c26b46b");
+        // Test explicit sha256
+        let s = render("{{ \"foo\" | hash(algorithm=\"sha256\", len=8) }}");
+        assert_eq!(s, "2c26b46b");
+        // Test blake3 - BLAKE3 of "foo" starts with 04e0bb39
+        let s = render("{{ \"foo\" | hash(algorithm=\"blake3\", len=8) }}");
         assert_eq!(s, "04e0bb39");
     }
 

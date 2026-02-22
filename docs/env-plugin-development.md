@@ -12,11 +12,17 @@ Unlike [tool plugins](tool-plugin-development.md) and [backend plugins](backend-
 
 ## Quick Start
 
-The fastest way to create an environment plugin is to use the [mise-env-plugin-template](https://github.com/jdx/mise-env-sample):
+The fastest way to create an environment plugin is to use the [mise-env-plugin-template](https://github.com/jdx/mise-env-plugin-template).
+
+::: tip
+The [mise-env-plugin-template](https://github.com/jdx/mise-env-plugin-template) provides a ready-to-use starting point with LuaCATS type definitions, stylua formatting, and hk linting pre-configured.
+:::
+
+To get started:
 
 ```bash
 # Clone the template
-git clone https://github.com/jdx/mise-env-sample my-env-plugin
+git clone https://github.com/jdx/mise-env-plugin-template my-env-plugin
 cd my-env-plugin
 
 # Customize for your use case
@@ -89,6 +95,10 @@ function PLUGIN:MiseEnv(ctx)
 end
 ```
 
+::: tip
+When `cmd.exec()` is called from `MiseEnv` or `MisePath` hooks, it inherits the mise-constructed environment — including `_.path` entries and environment variables from preceding directives. If the module directive is configured with `tools = true` (e.g., `_.my-plugin = { tools = true }`), tool installation bin paths are also included, so mise-managed tools are directly callable (e.g., `cmd.exec("node --version")`).
+:::
+
 **Return value**: Either a simple array of env keys, or a table with caching metadata.
 
 Simple format - array of tables, each with:
@@ -125,6 +135,17 @@ When `cacheable = true`, mise will cache the environment variables and only re-e
 - Any file in `watch_files` changes
 - The mise configuration changes
 - The cache TTL expires (configured via `env_cache_ttl` setting)
+
+::: tip
+For caching to work, users must enable the `env_cache` setting:
+
+```toml
+# ~/.config/mise/config.toml
+[settings]
+env_cache = true
+```
+
+:::
 
 ### hooks/mise_path.lua
 
@@ -171,7 +192,11 @@ With configuration options:
 
 ```toml
 [env]
-_.my-env-plugin = { api_url = "https://prod.api.example.com", debug = false, custom_bin_path = "/custom/path/bin" }
+_.my-env-plugin = {
+  api_url = "https://prod.api.example.com",
+  debug = false,
+  custom_bin_path = "/custom/path/bin",
+}
 ```
 
 All fields in the TOML table are passed to your hooks as `ctx.options`.
@@ -233,7 +258,10 @@ end
 
 ```toml
 [env]
-_.vault-secrets = { vault_url = "https://vault.example.com", secrets_path = "secret/data/myapp/production" }
+_.vault-secrets = {
+  vault_url = "https://vault.example.com",
+  secrets_path = "secret/data/myapp/production",
+}
 ```
 
 ## Available Lua Modules
@@ -313,6 +341,8 @@ This is preferred over manual caching because:
 - Cache is encrypted with session-scoped keys
 - Integrates with `mise cache clear` and `mise cache prune`
 - Respects the `env_cache_ttl` setting
+
+Note: Users must enable `env_cache = true` in their settings for caching to work.
 
 ### 5. Support Multiple Environments
 
@@ -399,7 +429,7 @@ See [Plugin Publishing](/plugin-publishing.html) for detailed instructions.
 
 ## Examples
 
-- [mise-env-sample](https://github.com/jdx/mise-env-sample) - Simple example showing basic usage
+- [mise-env-sample](https://github.com/jdx/mise-env-plugin-template) - Simple example showing basic usage
 - The [mise-plugins](https://github.com/mise-plugins) organization currently hosts tool plugins only—add your environment plugin there (or share it with the community) so others can learn from more examples
 
 ## Migration from Tool Plugins

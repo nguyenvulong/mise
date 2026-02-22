@@ -144,6 +144,7 @@ export default withMermaid(
             { text: "File Tasks", link: "/tasks/file-tasks" },
             { text: "Task Arguments", link: "/tasks/task-arguments" },
             { text: "Task Configuration", link: "/tasks/task-configuration" },
+            { text: "Task Templates", link: "/tasks/templates" },
             { text: "Monorepo Tasks", link: "/tasks/monorepo" },
           ],
         },
@@ -361,6 +362,24 @@ export default withMermaid(
           "data-goatcounter": "https://jdx.goatcounter.com/count",
           async: "",
           src: "//gc.zgo.at/count.js",
+        },
+      ],
+      // OpenGraph
+      ["meta", { property: "og:site_name", content: "mise-en-place" }],
+      ["meta", { property: "og:type", content: "website" }],
+      [
+        "meta",
+        {
+          property: "og:image",
+          content: "https://mise.jdx.dev/android-chrome-512x512.png",
+        },
+      ],
+      ["meta", { name: "twitter:card", content: "summary" }],
+      [
+        "meta",
+        {
+          name: "twitter:image",
+          content: "https://mise.jdx.dev/android-chrome-512x512.png",
         },
       ],
     ],

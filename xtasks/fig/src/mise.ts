@@ -744,28 +744,6 @@ const completionSpec: Fig.Spec = {
       description: "Manage config files",
       subcommands: [
         {
-          name: ["generate", "g"],
-          description: "Generate a mise.toml file",
-          options: [
-            {
-              name: ["-o", "--output"],
-              description: "Output to file instead of stdout",
-              isRepeatable: false,
-              args: {
-                name: "output",
-              },
-            },
-            {
-              name: ["-t", "--tool-versions"],
-              description: "Path to a .tool-versions file to import tools from",
-              isRepeatable: false,
-              args: {
-                name: "tool_versions",
-              },
-            },
-          ],
-        },
-        {
           name: "get",
           description: "Display the value of a setting in a mise.toml file",
           options: [
@@ -843,7 +821,9 @@ const completionSpec: Fig.Spec = {
             },
             {
               name: "value",
-              description: "The value to set the key to",
+              description:
+                "The value to set the key to (optional if provided as KEY=VALUE)",
+              isOptional: true,
             },
           ],
         },
@@ -1093,16 +1073,14 @@ const completionSpec: Fig.Spec = {
           ],
         },
         {
-          name: ["config", "g"],
-          description: "[experimental] Generate a mise.toml file",
+          name: "config",
+          description: "Generate a mise.toml file",
           options: [
             {
-              name: ["-o", "--output"],
-              description: "Output to file instead of stdout",
+              name: ["-n", "--dry-run"],
+              description:
+                "Show what would be generated without writing to file",
               isRepeatable: false,
-              args: {
-                name: "output",
-              },
             },
             {
               name: ["-t", "--tool-versions"],
@@ -1113,6 +1091,12 @@ const completionSpec: Fig.Spec = {
               },
             },
           ],
+          args: {
+            name: "path",
+            description: "Path to the config file to create",
+            isOptional: true,
+            template: "filepaths",
+          },
         },
         {
           name: "devcontainer",
@@ -1318,6 +1302,12 @@ const completionSpec: Fig.Spec = {
               },
             },
             {
+              name: "--lock",
+              description:
+                "Resolve and embed lockfile data (exact version + platform URLs/checksums) into an existing stub file for reproducible installs without runtime API calls",
+              isRepeatable: false,
+            },
+            {
               name: "--platform-bin",
               description:
                 "Platform-specific binary paths in the format platform:path",
@@ -1383,6 +1373,31 @@ const completionSpec: Fig.Spec = {
       ],
     },
     {
+      name: "edit",
+      description: "Edit mise.toml interactively",
+      options: [
+        {
+          name: ["-n", "--dry-run"],
+          description: "Show what would be generated without writing to file",
+          isRepeatable: false,
+        },
+        {
+          name: ["-t", "--tool-versions"],
+          description: "Path to a .tool-versions file to import tools from",
+          isRepeatable: false,
+          args: {
+            name: "tool_versions",
+          },
+        },
+      ],
+      args: {
+        name: "path",
+        description: "Path to the config file to create",
+        isOptional: true,
+        template: "filepaths",
+      },
+    },
+    {
       name: ["install", "i"],
       description: "Install a tool version",
       options: [
@@ -1417,6 +1432,12 @@ const completionSpec: Fig.Spec = {
           args: {
             name: "before",
           },
+        },
+        {
+          name: "--dry-run-code",
+          description:
+            "Like --dry-run but exits with code 1 if there are tools to install",
+          isRepeatable: false,
         },
         {
           name: "--raw",
@@ -1576,6 +1597,11 @@ const completionSpec: Fig.Spec = {
           isRepeatable: false,
         },
         {
+          name: "--all-sources",
+          description: "Display all tracked config sources for tools",
+          isRepeatable: false,
+        },
+        {
           name: "--no-header",
           description: "Don't display headers",
           isRepeatable: false,
@@ -1722,7 +1748,7 @@ const completionSpec: Fig.Spec = {
             {
               name: "new_plugin",
               description:
-                "The name of the plugin to install\ne.g.: node, ruby\nCan specify multiple plugins: `mise plugins install node ruby python`",
+                "The name of the plugin to install\ne.g.: cmake, poetry\nCan specify multiple plugins: `mise plugins install cmake poetry`",
               isOptional: true,
               generators: completionGeneratorTemplate(`mise plugins --all`),
               debounce: true,
@@ -1747,11 +1773,11 @@ const completionSpec: Fig.Spec = {
           args: [
             {
               name: "name",
-              description: "The name of the plugin\ne.g.: node, ruby",
+              description: "The name of the plugin\ne.g.: cmake, poetry",
             },
             {
               name: "dir",
-              description: "The local path to the plugin\ne.g.: ./mise-node",
+              description: "The local path to the plugin\ne.g.: ./vfox-cmake",
               isOptional: true,
               template: "folders",
             },
@@ -1764,7 +1790,7 @@ const completionSpec: Fig.Spec = {
             {
               name: ["-u", "--urls"],
               description:
-                "Show the git url for each plugin\ne.g.: https://github.com/asdf-vm/asdf-nodejs.git",
+                "Show the git url for each plugin\ne.g.: https://github.com/mise-plugins/vfox-cmake.git",
               isRepeatable: false,
             },
           ],
@@ -1845,7 +1871,7 @@ const completionSpec: Fig.Spec = {
         {
           name: ["-u", "--urls"],
           description:
-            "Show the git url for each plugin\ne.g.: https://github.com/asdf-vm/asdf-nodejs.git",
+            "Show the git url for each plugin\ne.g.: https://github.com/mise-plugins/vfox-cmake.git",
           isRepeatable: false,
         },
         {
@@ -1905,6 +1931,12 @@ const completionSpec: Fig.Spec = {
           name: "--configs",
           description:
             "Prune only tracked and trusted configuration links that point to non-existent configurations",
+          isRepeatable: false,
+        },
+        {
+          name: "--dry-run-code",
+          description:
+            "Like --dry-run but exits with code 1 if there are tools to prune",
           isRepeatable: false,
         },
         {
@@ -2208,6 +2240,11 @@ const completionSpec: Fig.Spec = {
           description: "Prompt for environment variable values",
           isRepeatable: false,
         },
+        {
+          name: "--stdin",
+          description: "Read the value from stdin (for multiline input)",
+          isRepeatable: false,
+        },
       ],
       args: {
         name: "env_var",
@@ -2243,7 +2280,9 @@ const completionSpec: Fig.Spec = {
             },
             {
               name: "value",
-              description: "The value to set",
+              description:
+                "The value to set (optional if provided as KEY=VALUE)",
+              isOptional: true,
             },
           ],
         },
@@ -2324,7 +2363,9 @@ const completionSpec: Fig.Spec = {
             },
             {
               name: "value",
-              description: "The value to set",
+              description:
+                "The value to set (optional if provided as KEY=VALUE)",
+              isOptional: true,
             },
           ],
         },
@@ -2456,7 +2497,9 @@ const completionSpec: Fig.Spec = {
             },
             {
               name: "command",
-              description: "The command to run",
+              description:
+                "The command to run (optional if provided as ALIAS=COMMAND)",
+              isOptional: true,
             },
           ],
         },
@@ -3024,7 +3067,7 @@ const completionSpec: Fig.Spec = {
       options: [
         {
           name: ["-a", "--all"],
-          description: "Test every tool specified in registry.toml",
+          description: "Test every tool specified in registry/",
           isRepeatable: false,
         },
         {
@@ -3043,7 +3086,7 @@ const completionSpec: Fig.Spec = {
         {
           name: "--include-non-defined",
           description:
-            "Also test tools not defined in registry.toml, guessing how to test it",
+            "Also test tools not defined in registry/, guessing how to test it",
           isRepeatable: false,
         },
         {
@@ -3179,6 +3222,12 @@ const completionSpec: Fig.Spec = {
           description: "Do not actually delete anything",
           isRepeatable: false,
         },
+        {
+          name: "--dry-run-code",
+          description:
+            "Like --dry-run but exits with code 1 if there are tools to uninstall",
+          isRepeatable: false,
+        },
       ],
       args: {
         name: "installed_tool@version",
@@ -3309,6 +3358,12 @@ const completionSpec: Fig.Spec = {
           },
         },
         {
+          name: "--dry-run-code",
+          description:
+            "Like --dry-run but exits with code 1 if there are outdated tools",
+          isRepeatable: false,
+        },
+        {
           name: "--raw",
           description:
             "Directly pipe stdin/stdout/stderr from plugin to user Sets --jobs=1",
@@ -3379,6 +3434,12 @@ const completionSpec: Fig.Spec = {
           args: {
             name: "before",
           },
+        },
+        {
+          name: "--dry-run-code",
+          description:
+            "Like --dry-run but exits with code 1 if there are changes to make",
+          isRepeatable: false,
         },
         {
           name: "--fuzzy",

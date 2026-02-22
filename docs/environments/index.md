@@ -115,6 +115,7 @@ tools. To do that, turn the value into a map with `tools = true`:
 [env]
 MY_VAR = { value = "tools path: {{env.PATH}}", tools = true }
 _.path = { path = ["{{env.GEM_HOME}}/bin"], tools = true } # directives may also set tools = true
+NODE_VERSION = { value = "{{ tools.node.version }}", tools = true }
 ```
 
 ## Redactions
@@ -182,9 +183,15 @@ You can also provide help text to guide users on how to set the variable:
 
 ```toml
 [env]
-DATABASE_URL = { required = "Set DATABASE_URL to your PostgreSQL connection string (e.g., postgres://user:pass@localhost/dbname)" }
-API_KEY = { required = "Get your API key from https://example.com/api-keys" }
-AWS_REGION = { required = "Set to your AWS region (e.g., us-east-1, eu-west-1)" }
+DATABASE_URL = {
+  required = "Set DATABASE_URL to your PostgreSQL connection string (e.g., postgres://user:pass@localhost/dbname)",
+}
+API_KEY = {
+  required = "Get your API key from https://example.com/api-keys",
+}
+AWS_REGION = {
+  required = "Set to your AWS region (e.g., us-east-1, eu-west-1)",
+}
 ```
 
 When a required variable is missing, mise will show the help text in the error message to assist users.
@@ -488,7 +495,7 @@ The plugin could detect the current git branch and set `ENVIRONMENT=production` 
 
 See [Environment Plugins](/plugins#environment-plugins) in the Plugins documentation for a complete guide to creating your own environment plugins.
 
-For a working example, see the [mise-env-sample](https://github.com/jdx/mise-env-sample) repository.
+For a working example, see the [mise-env-plugin-template](https://github.com/jdx/mise-env-plugin-template) repository.
 
 ## Multiple `env._` Directives
 
@@ -532,3 +539,41 @@ LD_LIBRARY_PATH = "/some/path:{{env.MY_PROJ_LIB}}"
 ```
 
 Of course the ordering matters when doing this.
+
+## Shell-style variable expansion
+
+As a simpler alternative to Tera templates for referencing env vars, you can use shell-style `$VAR` syntax
+by enabling the [`env_shell_expand`](/configuration/settings.html#env_shell_expand) setting:
+
+```toml
+[settings]
+env_shell_expand = true
+
+[env]
+MY_PROJ_LIB = "{{config_root}}/lib"
+LD_LIBRARY_PATH = "$MY_PROJ_LIB:$LD_LIBRARY_PATH"
+```
+
+Supported syntax:
+
+| Syntax            | Description                                                                           |
+| ----------------- | ------------------------------------------------------------------------------------- |
+| `$VAR`            | Expands to the value of `VAR`                                                         |
+| `${VAR}`          | Same, useful when followed by alphanumeric characters (e.g., `${VAR}_suffix`)         |
+| `${VAR:-default}` | Uses `default` if `VAR` is unset or empty                                             |
+| `${VAR:-}`        | Expands to empty string if `VAR` is unset (suppresses the undefined variable warning) |
+
+Expansion runs after Tera template rendering, so both syntaxes can be mixed.
+Undefined variables without a default are left unexpanded and produce a warning.
+
+The setting is a 3-way toggle:
+
+- **`true`** — enable shell expansion
+- **`false`** — disable shell expansion, no warning
+- **unset** (default) — disable shell expansion but warn if `$` is detected
+
+<!-- TODO(2026.7.0): update this to say shell expansion is enabled by default -->
+
+::: tip
+Shell expansion will become the default behavior in the 2026.7.0 release. Set `env_shell_expand = true` now to opt in early, or `env_shell_expand = false` to preserve the current behavior.
+:::

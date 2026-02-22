@@ -8,7 +8,7 @@ use crate::config::Settings;
 use crate::duration::parse_into_timestamp;
 use crate::hooks::Hooks;
 use crate::toolset::{InstallOptions, ResolveOptions, ToolRequest, ToolSource, Toolset};
-use crate::{config, env, hooks};
+use crate::{config, env, exit, hooks};
 use eyre::Result;
 use itertools::Itertools;
 use jiff::Timestamp;
@@ -55,6 +55,12 @@ pub struct Install {
     #[clap(long, verbatim_doc_comment)]
     before: Option<String>,
 
+    /// Like --dry-run but exits with code 1 if there are tools to install
+    ///
+    /// This is useful for scripts to check if tools need to be installed.
+    #[clap(long, verbatim_doc_comment)]
+    dry_run_code: bool,
+
     /// Directly pipe stdin/stdout/stderr from plugin to user
     /// Sets --jobs=1
     #[clap(long, overrides_with = "jobs")]
@@ -62,6 +68,10 @@ pub struct Install {
 }
 
 impl Install {
+    fn is_dry_run(&self) -> bool {
+        self.dry_run || self.dry_run_code
+    }
+
     #[async_backtrace::framed]
     pub async fn run(self) -> Result<()> {
         let config = Config::get().await?;
@@ -121,6 +131,16 @@ impl Install {
             .iter()
             .map(|ta| ta.ba.short.clone())
             .collect();
+        // Collect inactive tool names before trs borrow is consumed
+        let inactive_tools: Vec<String> = expanded_runtimes
+            .iter()
+            .filter(|ta| {
+                trs.sources
+                    .get(ta.ba.as_ref())
+                    .is_none_or(|s| s.is_argument())
+            })
+            .map(|ta| ta.ba.short.clone())
+            .collect();
         let mut ts: Toolset = trs.filter_by_tool(tools).into();
         let tool_versions = self.get_requested_tool_versions(&ts, &expanded_runtimes)?;
         let mut versions = if tool_versions.is_empty() {
@@ -131,6 +151,23 @@ impl Install {
             ts.install_all_versions(&mut config, tool_versions, &self.install_opts()?)
                 .await?
         };
+        // In dry-run mode, check if any tools would be installed before filtering
+        if self.is_dry_run() {
+            if self.dry_run_code {
+                let has_work = versions.iter().any(|tv| {
+                    if let Ok(backend) = tv.backend() {
+                        !backend.is_version_installed(&config, tv, true)
+                    } else {
+                        true
+                    }
+                });
+                if has_work {
+                    exit::exit(1);
+                }
+            }
+            return Ok(());
+        }
+
         // because we may be installing a tool that is not in config, we need to restore the original tool args and reset everything
         env::TOOL_ARGS
             .write()
@@ -142,10 +179,26 @@ impl Install {
         // ensure that only current versions are sent to lockfile rebuild
         versions.retain(|tv| current_versions.iter().any(|(_, cv)| tv == cv));
 
-        // Skip rebuilding shims and symlinks in dry-run mode
-        if !self.dry_run {
-            config::rebuild_shims_and_runtime_symlinks(&config, ts, &versions).await?;
+        config::rebuild_shims_and_runtime_symlinks(&config, ts, &versions).await?;
+
+        // Warn about tools that were installed but not in any config file
+        if !inactive_tools.is_empty() {
+            let tool_list = inactive_tools.join(", ");
+            let use_cmds: Vec<String> = inactive_tools
+                .iter()
+                .map(|t| format!("  mise use {t}"))
+                .collect();
+            warn!(
+                "{tool_list} installed but not activated — {} not in any config file.\nTo install and activate, run:\n{}",
+                if inactive_tools.len() == 1 {
+                    "it is"
+                } else {
+                    "they are"
+                },
+                use_cmds.join("\n"),
+            );
         }
+
         Ok(())
     }
 
@@ -160,7 +213,7 @@ impl Install {
                 latest_versions: true,
                 before_date: self.get_before_date()?,
             },
-            dry_run: self.dry_run,
+            dry_run: self.is_dry_run(),
             locked: Settings::get().locked,
             ..Default::default()
         })
@@ -219,20 +272,25 @@ impl Install {
             config.get_tool_request_set().await?
         });
 
+        // Install plugins from [plugins] config section first
+        // This must happen before checking for missing tools so env-only plugins get installed
+        Toolset::ensure_config_plugins_installed(&config, self.is_dry_run()).await?;
+
         // Check for tools that don't exist in the registry
         // These were tracked during build() before being filtered out
         for ba in &trs.unknown_tools {
             // This will error with a proper message like "tool not found in mise tool registry"
             ba.backend()?;
         }
-        let versions = measure!("fetching missing runtimes", {
+        let missing = measure!("fetching missing runtimes", {
             trs.missing_tools(&config)
                 .await
                 .into_iter()
                 .cloned()
                 .collect_vec()
         });
-        let versions = if versions.is_empty() {
+        let has_missing = !missing.is_empty();
+        let versions = if missing.is_empty() {
             measure!("run_postinstall_hook", {
                 info!("all tools are installed");
                 hooks::run_one_hook(
@@ -247,17 +305,20 @@ impl Install {
         } else {
             let mut ts = Toolset::from(trs.clone());
             measure!("install_all_versions", {
-                ts.install_all_versions(&mut config, versions, &self.install_opts()?)
+                ts.install_all_versions(&mut config, missing, &self.install_opts()?)
                     .await?
             })
         };
-        // Skip rebuilding shims and symlinks in dry-run mode
-        if !self.dry_run {
-            measure!("rebuild_shims_and_runtime_symlinks", {
-                let ts = config.get_toolset().await?;
-                config::rebuild_shims_and_runtime_symlinks(&config, ts, &versions).await?;
-            });
+        if self.is_dry_run() {
+            if self.dry_run_code && has_missing {
+                exit::exit(1);
+            }
+            return Ok(());
         }
+        measure!("rebuild_shims_and_runtime_symlinks", {
+            let ts = config.get_toolset().await?;
+            config::rebuild_shims_and_runtime_symlinks(&config, ts, &versions).await?;
+        });
         Ok(())
     }
 }

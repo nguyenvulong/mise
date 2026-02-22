@@ -16,6 +16,7 @@ use crate::config::{Config, Settings};
 use crate::file::{display_path, remove_all, remove_all_with_warning};
 use crate::install_context::InstallContext;
 use crate::lockfile::PlatformInfo;
+use crate::path_env::PathEnv;
 use crate::platform::Platform;
 use crate::plugins::core::CORE_PLUGINS;
 use crate::plugins::{PluginType, VERSION_REGEX};
@@ -30,7 +31,7 @@ use crate::{
     cache::{CacheManager, CacheManagerBuilder},
     plugins::PluginEnum,
 };
-use crate::{dirs, env, file, hash, lock_file, plugins, versions_host};
+use crate::{dirs, env, file, hash, lock_file, versions_host};
 use async_trait::async_trait;
 use backend_type::BackendType;
 use console::style;
@@ -383,7 +384,7 @@ pub trait Backend: Debug + Send + Sync {
         }
         let mut deps: IndexSet<_> = deps.into_iter().map(BackendArg::from).collect();
         if let Some(rt) = REGISTRY.get(self.ba().short.as_str()) {
-            // add dependencies from registry.toml
+            // add dependencies from registry/
             deps.extend(rt.depends.iter().map(BackendArg::from));
         }
         deps.retain(|ba| &**self.ba() != ba);
@@ -442,8 +443,32 @@ pub trait Backend: Debug + Send + Sync {
             }
             matches
         } else {
-            true // Core plugins and plugins without remote URLs can use versions host
+            // For non-plugin backends (e.g. github:, cargo:), check if the backend matches
+            // the registry's default. When a user aliases a tool to a different backend
+            // (e.g. `php = "github:verzly/php"`), the versions host would return versions
+            // from the registry's default backend which may not match the aliased backend.
+            let full = ba.full();
+            if let Some(rt) = REGISTRY.get(ba.short.as_str()) {
+                let is_registry_backend = rt.backends().iter().any(|b| *b == full);
+                if !is_registry_backend {
+                    trace!(
+                        "Skipping versions host for {} because backend {} is not the registry default",
+                        ba.short, full
+                    );
+                }
+                is_registry_backend
+            } else {
+                true // Not in registry, safe to use versions host
+            }
         };
+
+        if Settings::get().offline() {
+            trace!(
+                "Skipping remote version listing for {} due to offline mode",
+                ba.to_string()
+            );
+            return Ok(vec![]);
+        }
 
         let versions = remote_versions
             .get_or_try_init_async(|| async {
@@ -538,6 +563,17 @@ pub trait Backend: Debug + Send + Sync {
                 if let Some(install_path) = tv.request.install_path(config)
                     && check_path(&install_path, true)
                 {
+                    // For Prefix requests, install_path finds any installed dir
+                    // matching the prefix (e.g., "1.0.0" for prefix "1"), but if
+                    // the ToolVersion resolved to a different version (e.g., "1.1.0"),
+                    // we must not treat it as installed.
+                    if let ToolRequest::Prefix { .. } = &tv.request
+                        && install_path
+                            .file_name()
+                            .is_some_and(|f| f.to_string_lossy() != tv.version)
+                    {
+                        return check_path(&tv.install_path(), check_symlink);
+                    }
                     return true;
                 }
                 check_path(&tv.install_path(), check_symlink)
@@ -818,6 +854,12 @@ pub trait Backend: Debug + Send + Sync {
             .unwrap_or_default())
     }
     async fn parse_idiomatic_file(&self, path: &Path) -> eyre::Result<String> {
+        if path.file_name().is_some_and(|f| f == "package.json") {
+            let pkg = crate::package_json::PackageJson::parse(path)?;
+            return pkg
+                .package_manager_version(self.id())
+                .ok_or_else(|| eyre::eyre!("no {} version found in package.json", self.id()));
+        }
         let contents = file::read_to_string(path)?;
         Ok(contents.trim().to_string())
     }
@@ -830,6 +872,27 @@ pub trait Backend: Debug + Send + Sync {
         ctx: InstallContext,
         tv: ToolVersion,
     ) -> eyre::Result<ToolVersion> {
+        // Check for --locked mode: if enabled and no lockfile URL exists, fail early
+        // Exempt tool stubs from lockfile requirements since they are ephemeral
+        // Also exempt backends that don't support URL locking (e.g., Rust uses rustup)
+        // This must run before the dry-run check so that --locked --dry-run still validates
+        if ctx.locked && !tv.request.source().is_tool_stub() && self.supports_lockfile_url() {
+            let platform_key = self.get_platform_key();
+            let has_lockfile_url = tv
+                .lock_platforms
+                .get(&platform_key)
+                .and_then(|p| p.url.as_ref())
+                .is_some();
+            if !has_lockfile_url {
+                bail!(
+                    "No lockfile URL found for {} on platform {} (--locked mode)\n\
+                    hint: Run `mise lock` to generate lockfile URLs, or disable locked mode",
+                    tv.style(),
+                    platform_key
+                );
+            }
+        }
+
         // Handle dry-run mode early to avoid plugin installation
         if ctx.dry_run {
             use crate::ui::progress_report::ProgressIcon;
@@ -847,32 +910,23 @@ pub trait Backend: Debug + Send + Sync {
             plugin.is_installed_err()?;
         }
 
-        if self.is_version_installed(&ctx.config, &tv, true) {
-            if ctx.force {
-                self.uninstall_version(&ctx.config, &tv, ctx.pr.as_ref(), false)
-                    .await?;
-            } else {
-                return Ok(tv);
-            }
-        }
-        // Check for --locked mode: if enabled and no lockfile URL exists, fail early
-        // Exempt tool stubs from lockfile requirements since they are ephemeral
-        // Also exempt backends that don't support URL locking (e.g., Rust uses rustup)
-        if ctx.locked && !tv.request.source().is_tool_stub() && self.supports_lockfile_url() {
-            let platform_key = self.get_platform_key();
-            let has_lockfile_url = tv
-                .lock_platforms
-                .get(&platform_key)
-                .and_then(|p| p.url.as_ref())
-                .is_some();
-            if !has_lockfile_url {
-                bail!(
-                    "No lockfile URL found for {} on platform {} (--locked mode)\n\
-                    hint: Run `mise lock` to generate lockfile URLs, or disable locked mode",
-                    tv.style(),
-                    platform_key
-                );
-            }
+        let will_uninstall = ctx.force && self.is_version_installed(&ctx.config, &tv, true);
+
+        // Query backend for operation count and set up progress tracking
+        let install_ops = self.install_operation_count(&tv, &ctx).await;
+        let total_ops = if will_uninstall {
+            install_ops + 1
+        } else {
+            install_ops
+        };
+        ctx.pr.start_operations(total_ops);
+
+        if will_uninstall {
+            self.uninstall_version(&ctx.config, &tv, ctx.pr.as_ref(), false)
+                .await?;
+            ctx.pr.next_operation();
+        } else if self.is_version_installed(&ctx.config, &tv, true) {
+            return Ok(tv);
         }
 
         // Track the installation asynchronously (fire-and-forget)
@@ -950,8 +1004,17 @@ pub trait Backend: Debug + Send + Sync {
             }
         }
 
+        // Use the backend's list_bin_paths to get the correct binary directories
+        // instead of hardcoding install_path/bin, which may not match the actual
+        // binary location for backends like aqua
+        let bin_paths = self.list_bin_paths(&ctx.config, tv).await?;
+        let mut path_env = PathEnv::from_iter(env::PATH.clone());
+        for p in bin_paths {
+            path_env.add(p);
+        }
+
         CmdLineRunner::new(&*env::SHELL)
-            .env(&*env::PATH_KEY, plugins::core::path_env_with_tv_path(tv)?)
+            .env(&*env::PATH_KEY, path_env.join())
             .env("MISE_TOOL_INSTALL_PATH", tv.install_path())
             .env("MISE_TOOL_NAME", tv.ba().short.clone())
             .env("MISE_TOOL_VERSION", tv.version.clone())
@@ -962,6 +1025,14 @@ pub trait Backend: Debug + Send + Sync {
             .execute()?;
         Ok(())
     }
+
+    /// Returns the number of operations for installation progress tracking.
+    /// Override this if your backend has a different number of operations.
+    /// Default is 3: download, checksum, extract
+    async fn install_operation_count(&self, _tv: &ToolVersion, _ctx: &InstallContext) -> usize {
+        3
+    }
+
     async fn install_version_(&self, ctx: &InstallContext, tv: ToolVersion) -> Result<ToolVersion>;
     async fn uninstall_version(
         &self,
@@ -1254,7 +1325,7 @@ pub trait Backend: Debug + Send + Sync {
     ) -> Result<()> {
         let settings = Settings::get();
         let filename = file.file_name().unwrap().to_string_lossy().to_string();
-        let lockfile_enabled = settings.lockfile && settings.experimental;
+        let lockfile_enabled = settings.lockfile;
 
         // Get the platform key for this tool and platform
         let platform_key = self.get_platform_key();
@@ -1422,6 +1493,30 @@ pub trait Backend: Debug + Send + Sync {
             conda_deps: None,
         })
     }
+}
+
+/// Helper function for calculating install operation count in HTTP/S3-style backends.
+/// Used by HttpBackend and S3Backend to avoid code duplication.
+pub fn http_install_operation_count(
+    has_checksum_opt: bool,
+    platform_key: &str,
+    tv: &ToolVersion,
+) -> usize {
+    let settings = Settings::get();
+    let mut count = 2; // download + extraction
+    if has_checksum_opt {
+        count += 1;
+    }
+    let lockfile_enabled = settings.lockfile;
+    let has_lockfile_checksum = tv
+        .lock_platforms
+        .get(platform_key)
+        .and_then(|p| p.checksum.as_ref())
+        .is_some();
+    if lockfile_enabled || has_lockfile_checksum {
+        count += 1;
+    }
+    count
 }
 
 fn find_match_in_list(list: &[String], query: &str) -> Option<String> {

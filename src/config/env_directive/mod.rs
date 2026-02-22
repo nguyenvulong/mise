@@ -3,12 +3,14 @@ use crate::dirs;
 use crate::env;
 use crate::env_diff::EnvMap;
 use crate::file::display_path;
+use crate::path_env::PathEnv;
 use crate::tera::{get_tera, tera_exec};
 use eyre::{Context, eyre};
 use indexmap::IndexMap;
 use itertools::Itertools;
 use serde_json::Value;
-use std::collections::{BTreeSet, HashMap};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::{Debug, Display, Formatter};
 use std::path::{Path, PathBuf};
 use std::{cmp::PartialEq, sync::Arc};
@@ -19,7 +21,7 @@ mod file;
 mod module;
 mod path;
 mod source;
-mod venv;
+pub(crate) mod venv;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum RequiredValue {
@@ -531,7 +533,26 @@ impl EnvResults {
                     .await?;
                 }
                 EnvDirective::Module(name, value, _opts) => {
-                    Self::module(&mut r, source, name, &value, redact.unwrap_or(false)).await?;
+                    let mut env_map: IndexMap<String, String> = env
+                        .iter()
+                        .map(|(k, (v, _))| (k.clone(), v.clone()))
+                        .collect();
+                    // Incorporate _.path entries accumulated so far into PATH
+                    // so that cmd.exec in the plugin can find tools on PATH.
+                    if !paths.is_empty() {
+                        let existing_path =
+                            env_map.get(&*env::PATH_KEY).cloned().unwrap_or_default();
+                        let mut path_env = PathEnv::from_path_str(&existing_path);
+                        for (p, path_source) in &paths {
+                            let config_root =
+                                crate::config::config_file::config_root::config_root(path_source);
+                            for s in env::split_paths(p) {
+                                path_env.add(normalize_path(&config_root, s));
+                            }
+                        }
+                        env_map.insert(env::PATH_KEY.to_string(), path_env.to_string());
+                    }
+                    Self::module(&mut r, config, source, name, &value, redact, env_map).await?;
                 }
             };
         }
@@ -641,13 +662,64 @@ impl EnvResults {
         path: &Path,
         input: &str,
     ) -> eyre::Result<String> {
-        if !input.contains("{{") && !input.contains("{%") && !input.contains("{#") {
-            return Ok(input.to_string());
+        let mut output = input.to_string();
+
+        // Step 1: Tera template expansion
+        if input.contains("{{") || input.contains("{%") || input.contains("{#") {
+            trust_check(path)?;
+            output = tera
+                .render_str(input, ctx)
+                .wrap_err_with(|| eyre!("failed to parse template: '{input}'"))?;
         }
-        trust_check(path)?;
-        let output = tera
-            .render_str(input, ctx)
-            .wrap_err_with(|| eyre!("failed to parse template: '{input}'"))?;
+
+        // Step 2: Shell-style $VAR expansion
+        if output.contains('$') {
+            debug_assert!(
+                !env!("CARGO_PKG_VERSION").starts_with("2026.7"),
+                "change env_shell_expand default to true and remove this warning"
+            );
+            match Settings::get().env_shell_expand {
+                Some(true) => {
+                    let env_vars: BTreeMap<String, String> = ctx
+                        .get("env")
+                        .and_then(|v| serde_json::from_value(v.clone()).ok())
+                        .unwrap_or_default();
+                    let before_expand = output.clone();
+                    let mut missing_vars = Vec::new();
+                    output = shellexpand::env_with_context_no_errors(&output, |var| match env_vars
+                        .get(var)
+                    {
+                        Some(v) => Some(Cow::Borrowed(v.as_str())),
+                        None => {
+                            missing_vars.push(var.to_string());
+                            None
+                        }
+                    })
+                    .into_owned();
+                    for var in missing_vars {
+                        // Don't warn if the user provided a default via ${VAR:-...} or ${VAR-...}
+                        if !before_expand.contains(&format!("${{{var}:-"))
+                            && !before_expand.contains(&format!("${{{var}-"))
+                        {
+                            warn_once!(
+                                "env var '{var}' is not defined and will be left unexpanded. \
+                                 Use ${{{var}:-}} to default to an empty string and suppress \
+                                 this warning."
+                            );
+                        }
+                    }
+                }
+                Some(false) => {}
+                None => {
+                    warn_once!(
+                        "env value contains '$' which will be expanded in a future release. \
+                         Set `env_shell_expand = true` to opt in or `env_shell_expand = false` to \
+                         keep current behavior and suppress this warning."
+                    );
+                }
+            }
+        }
+
         Ok(output)
     }
 

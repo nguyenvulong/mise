@@ -30,7 +30,7 @@ go in `[tools]` in `mise.toml`.
 
 ### `url` (Required)
 
-Specifies the HTTP URL to download the tool from. The URL supports templating with `{{version}}`:
+Specifies the HTTP URL to download the tool from. The URL supports templating with variables like `version`, `os()`, and `arch()`:
 
 ```toml
 [tools]
@@ -43,6 +43,32 @@ You can also use static URLs without templating:
 [tools]
 "http:my-tool" = { version = "1.0.0", url = "https://example.com/releases/my-tool-v1.0.0.tar.gz" }
 ```
+
+#### Template Variables
+
+The following template functions are available in URLs (use double curly braces, e.g., `version` becomes <code v-pre>{{version}}</code>):
+
+- `version` - The tool version
+- `os()` - Operating system: `macos`, `linux`, or `windows`
+- `arch()` - Architecture: `x64` or `arm64`
+- `os_family()` - OS family: `unix` or `windows`
+
+The `os()` and `arch()` functions support remapping for tools that use different naming conventions:
+
+```toml
+[tools]
+# HashiCorp tools use "darwin" instead of "macos" and "amd64" instead of "x64"
+"http:sentinel" = {
+  version = "latest",
+  url = 'https://releases.hashicorp.com/sentinel/{{version}}/sentinel_{{version}}_{{os(macos="darwin")}}_{{arch(x64="amd64")}}.zip',
+}
+```
+
+This produces URLs like:
+
+- macOS arm64: `sentinel_0.26.3_darwin_arm64.zip`
+- macOS x64: `sentinel_0.26.3_darwin_amd64.zip`
+- Linux x64: `sentinel_0.26.3_linux_amd64.zip`
 
 ### Platform-specific URLs
 
@@ -87,9 +113,18 @@ _Instead of specifying the checksum here, you can use [mise.lock](/dev-tools/mis
 version = "1.0.0"
 
 [tools."http:my-tool".platforms]
-macos-x64 = { url = "https://example.com/releases/my-tool-v1.0.0-macos-x64.tar.gz", checksum = "sha256:a1b2c3d4e5f6789..." }
-macos-arm64 = { url = "https://example.com/releases/my-tool-v1.0.0-macos-arm64.tar.gz", checksum = "sha256:b2c3d4e5f6789..." }
-linux-x64 = { url = "https://example.com/releases/my-tool-v1.0.0-linux-x64.tar.gz", checksum = "sha256:c3d4e5f6789..." }
+macos-x64 = {
+  url = "https://example.com/releases/my-tool-v1.0.0-macos-x64.tar.gz",
+  checksum = "sha256:a1b2c3d4e5f6789...",
+}
+macos-arm64 = {
+  url = "https://example.com/releases/my-tool-v1.0.0-macos-arm64.tar.gz",
+  checksum = "sha256:b2c3d4e5f6789...",
+}
+linux-x64 = {
+  url = "https://example.com/releases/my-tool-v1.0.0-linux-x64.tar.gz",
+  checksum = "sha256:c3d4e5f6789...",
+}
 ```
 
 ### `size`
@@ -112,9 +147,18 @@ You can specify different sizes for different platforms:
 version = "1.0.0"
 
 [tools."http:my-tool".platforms]
-macos-x64 = { url = "https://example.com/releases/my-tool-v1.0.0-macos-x64.tar.gz", size = "12345678" }
-macos-arm64 = { url = "https://example.com/releases/my-tool-v1.0.0-macos-arm64.tar.gz", size = "9876543" }
-linux-x64 = { url = "https://example.com/releases/my-tool-v1.0.0-linux-x64.tar.gz", size = "11111111" }
+macos-x64 = {
+  url = "https://example.com/releases/my-tool-v1.0.0-macos-x64.tar.gz",
+  size = "12345678",
+}
+macos-arm64 = {
+  url = "https://example.com/releases/my-tool-v1.0.0-macos-arm64.tar.gz",
+  size = "9876543",
+}
+linux-x64 = {
+  url = "https://example.com/releases/my-tool-v1.0.0-linux-x64.tar.gz",
+  size = "11111111",
+}
 ```
 
 ### `strip_components`
@@ -147,6 +191,23 @@ bin = "docker-compose"  # Rename from docker-compose-linux-x86_64 to docker-comp
 When downloading single binaries (not archives), mise automatically removes OS/arch suffixes from the filename. For example, `docker-compose-linux-x86_64` becomes `docker-compose` automatically. Use the `bin` option only when you need a specific custom name.
 :::
 
+### `rename_exe`
+
+Rename the executable inside an extracted archive to a specific name. This is useful when archives contain binaries with platform-specific names or when installing kubectl plugins that need specific naming:
+
+```toml
+[tools."http:openunison-cli"]
+version = "1.0.0"
+url = "https://nexus.tremolo.io/repository/openunison-cli/openunison-cli-v{{version}}-linux.zip"
+rename_exe = "kubectl-openunison-cli"  # Rename extracted binary for kubectl plugin
+```
+
+This works by searching for the first executable in the extracted directory (or `bin_path` if specified) and renaming it to the specified name.
+
+::: tip
+Use `bin` for renaming single binary downloads, and `rename_exe` for renaming executables inside archives.
+:::
+
 ### `format`
 
 Explicitly specify the archive format when the URL lacks a file extension or has an incorrect extension:
@@ -171,9 +232,18 @@ You can specify different formats for different platforms:
 version = "1.0.0"
 
 [tools."http:my-tool".platforms]
-macos-x64 = { url = "https://example.com/releases/my-tool-v1.0.0-macos-x64", format = "tar.xz" }
-linux-x64 = { url = "https://example.com/releases/my-tool-v1.0.0-linux-x64", format = "tar.gz" }
-windows-x64 = { url = "https://example.com/releases/my-tool-v1.0.0-windows-x64", format = "zip" }
+macos-x64 = {
+  url = "https://example.com/releases/my-tool-v1.0.0-macos-x64",
+  format = "tar.xz",
+}
+linux-x64 = {
+  url = "https://example.com/releases/my-tool-v1.0.0-linux-x64",
+  format = "tar.gz",
+}
+windows-x64 = {
+  url = "https://example.com/releases/my-tool-v1.0.0-windows-x64",
+  format = "zip",
+}
 ```
 
 ### `version_list_url`
@@ -274,7 +344,19 @@ version_expr = 'split(body, "\n")'
 
 # Split and filter empty lines
 version_expr = 'filter(split(body, "\n"), # != "")'
+
+# Parse JSON and extract object keys (useful for HashiCorp-style JSON)
+# e.g., {"versions": {"1.0.0": {}, "2.0.0": {}}}
+version_expr = 'keys(fromJSON(body).versions)'
 ```
+
+The [expr-lang](https://expr-lang.org/) library provides built-in functions including:
+
+- **`fromJSON(string)`**: Parse a JSON string into a value
+- **`toJSON(value)`**: Convert a value to a JSON string
+- **`keys(map)`**: Get the keys of an object/map as an array
+- **`values(map)`**: Get the values of an object/map as an array
+- **`len(value)`**: Get the length of a string, array, or map
 
 ::: tip
 `version_expr` takes precedence over `version_regex` and `version_json_path` if multiple are specified. Use it when the other options aren't flexible enough for your use case.

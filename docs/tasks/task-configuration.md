@@ -120,7 +120,8 @@ The structured format also supports combining env vars with arguments:
 ```mise-toml
 [tasks.deploy]
 depends = [
-  { task = "build", args = ["--release"], env = { RUSTFLAGS = "-C opt-level=3" } }
+  { task = "build", args = ["--release"],
+    env = { RUSTFLAGS = "-C opt-level=3" } }
 ]
 run = "./deploy.sh"
 ```
@@ -158,6 +159,11 @@ run = "eslint ."
 ```
 
 Supports the same argument and environment variable syntax as `depends`.
+
+`wait_for` matches tasks differently depending on whether args or env vars are specified:
+
+- `wait_for = ["setup"]` — matches by name, regardless of args or env overrides. If another task runs `depends = ["DEBUG=1 setup"]`, this will still match and wait for it.
+- `wait_for = ["setup arg1"]` or `wait_for = ["DEBUG=1 setup"]` — matches only tasks running with that exact args/env configuration.
 
 ### `env`
 
@@ -227,6 +233,18 @@ time to run. The user will be prompted to confirm before the task is run.
 confirm = "Are you sure you want to cut a release?"
 description = 'Cut a new release'
 file = 'scripts/release.sh'
+```
+
+The confirm message supports Tera templates and can reference usage arguments:
+
+```mise-toml
+[tasks.deploy]
+usage = '''
+arg "<environment>" help="Environment to deploy to"
+flag "--force" help="Force deployment"
+'''
+confirm = "Deploy to {{ usage.environment }}?{% if usage.force %} (forced){% endif %}"
+run = "deploy.sh ${usage_environment}"
 ```
 
 ### `raw`
@@ -563,7 +581,7 @@ mise supports monorepo-style task organization with target path syntax. Enable i
 For complete documentation on monorepo tasks including:
 
 - Task path syntax and wildcards
-- Tool inheritance from parent configs
+- Tool layering from parent configs
 - Performance tuning
 - Best practices and troubleshooting
 

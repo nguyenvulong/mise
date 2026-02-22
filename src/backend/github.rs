@@ -1,11 +1,11 @@
 use crate::backend::SecurityFeature;
 use crate::backend::VersionInfo;
-use crate::backend::asset_matcher::{self, Asset, ChecksumFetcher};
+use crate::backend::asset_matcher::{self, Asset, AssetPicker, ChecksumFetcher};
 use crate::backend::backend_type::BackendType;
 use crate::backend::platform_target::PlatformTarget;
 use crate::backend::static_helpers::{
     get_filename_from_url, install_artifact, lookup_platform_key, lookup_platform_key_for_target,
-    template_string, try_with_v_prefix, verify_artifact,
+    template_string, try_with_v_prefix, try_with_v_prefix_and_repo, verify_artifact,
 };
 use crate::cli::args::{BackendArg, ToolVersionType};
 use crate::config::{Config, Settings};
@@ -20,9 +20,10 @@ use crate::{backend::Backend, forgejo, github, gitlab};
 use async_trait::async_trait;
 use eyre::Result;
 use regex::Regex;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::sync::Arc;
+use xx::regex;
 
 #[derive(Debug)]
 pub struct UnifiedGitBackend {
@@ -48,12 +49,28 @@ enum VerificationStatus {
     Error(String),
 }
 
+/// Check if an SLSA verification error indicates a format/parsing issue rather than
+/// an actual verification failure. Some provenance files (e.g., BuildKit raw provenance)
+/// exist but aren't in a sigstore-verifiable format.
+fn is_slsa_format_issue(e: &sigstore_verification::AttestationError) -> bool {
+    match e {
+        sigstore_verification::AttestationError::NoAttestations => true,
+        sigstore_verification::AttestationError::Verification(msg) => {
+            msg.contains("does not contain valid attestations")
+                || msg.contains("No certificate found")
+                || msg.contains("neither DSSE envelope nor message signature")
+        }
+        _ => false,
+    }
+}
+
 /// Returns install-time-only option keys for GitHub/GitLab backend.
 pub fn install_time_option_keys() -> Vec<String> {
     vec![
         "asset_pattern".into(),
         "url".into(),
         "version_prefix".into(),
+        "no_app".into(),
     ]
 }
 
@@ -137,10 +154,13 @@ impl Backend for UnifiedGitBackend {
         features
     }
 
-    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> Result<Vec<VersionInfo>> {
+    async fn _list_remote_versions(&self, config: &Arc<Config>) -> Result<Vec<VersionInfo>> {
         let repo = self.ba.tool_name();
         let id = self.ba.to_string();
-        let opts = self.ba.opts();
+        let opts = config
+            .get_tool_opts(&self.ba)
+            .await?
+            .unwrap_or_else(|| self.ba.opts());
         let api_url = self.get_api_url(&opts);
         let version_prefix = opts.get("version_prefix");
 
@@ -176,7 +196,7 @@ impl Backend for UnifiedGitBackend {
                 .into_iter()
                 .filter(|r| version_prefix.is_none_or(|p| r.tag_name.starts_with(p)))
                 .map(|r| VersionInfo {
-                    version: self.strip_version_prefix(&r.tag_name),
+                    version: self.strip_version_prefix(&r.tag_name, &opts),
                     created_at: r.released_at,
                     release_url: Some(format!("{}/-/releases/{}", web_url_base, r.tag_name)),
                     ..Default::default()
@@ -188,7 +208,7 @@ impl Backend for UnifiedGitBackend {
                 .into_iter()
                 .filter(|r| version_prefix.is_none_or(|p| r.tag_name.starts_with(p)))
                 .map(|r| VersionInfo {
-                    version: self.strip_version_prefix(&r.tag_name),
+                    version: self.strip_version_prefix(&r.tag_name, &opts),
                     created_at: Some(r.created_at),
                     release_url: Some(format!("{}/releases/tag/{}", web_url_base, r.tag_name)),
                     ..Default::default()
@@ -200,7 +220,7 @@ impl Backend for UnifiedGitBackend {
                 .into_iter()
                 .filter(|r| version_prefix.is_none_or(|p| r.tag_name.starts_with(p)))
                 .map(|r| VersionInfo {
-                    version: self.strip_version_prefix(&r.tag_name),
+                    version: self.strip_version_prefix(&r.tag_name, &opts),
                     created_at: Some(r.created_at),
                     release_url: Some(format!("{}/releases/tag/{}", web_url_base, r.tag_name)),
                     ..Default::default()
@@ -230,7 +250,11 @@ impl Backend for UnifiedGitBackend {
         mut tv: ToolVersion,
     ) -> Result<ToolVersion> {
         let repo = self.repo();
-        let opts = tv.request.options();
+        let opts = ctx
+            .config
+            .get_tool_opts(&self.ba)
+            .await?
+            .unwrap_or_else(|| tv.request.options());
         let api_url = self.get_api_url(&opts);
 
         // Check if URL already exists in lockfile platforms first
@@ -381,35 +405,10 @@ impl UnifiedGitBackend {
         let filename = asset.name.clone();
         let file_path = tv.download_path().join(&filename);
 
-        // Count operations dynamically:
-        // 1. Download (always)
-        // 2. Verify checksum (if checksum option present)
-        // 3. Extract/install (if file needs extraction)
-        let mut op_count = 1; // download
-
         // Check if we'll verify checksum
         let has_checksum = lookup_platform_key(opts, "checksum")
             .or_else(|| opts.get("checksum").cloned())
             .is_some();
-        if has_checksum {
-            op_count += 1;
-        }
-
-        // Check if we'll extract (archives need extraction)
-        let needs_extraction = filename.ends_with(".tar.gz")
-            || filename.ends_with(".tar.xz")
-            || filename.ends_with(".tar.bz2")
-            || filename.ends_with(".tar.zst")
-            || filename.ends_with(".tar")
-            || filename.ends_with(".tgz")
-            || filename.ends_with(".txz")
-            || filename.ends_with(".tbz2")
-            || filename.ends_with(".zip");
-        if needs_extraction {
-            op_count += 1;
-        }
-
-        ctx.pr.start_operations(op_count);
 
         // Store the asset URL and digest (if available) in the tool version
         let platform_key = self.get_platform_key();
@@ -471,13 +470,17 @@ impl UnifiedGitBackend {
             .await?;
 
         // Verify and install
-        verify_artifact(tv, &file_path, opts, Some(ctx.pr.as_ref()))?;
+        ctx.pr.next_operation();
+        if has_checksum {
+            verify_artifact(tv, &file_path, opts, Some(ctx.pr.as_ref()))?;
+        }
         self.verify_checksum(ctx, tv, &file_path)?;
 
         // Verify attestations or SLSA (check attestations first, fall back to SLSA)
         self.verify_attestations_or_slsa(ctx, tv, &file_path)
             .await?;
 
+        ctx.pr.next_operation();
         install_artifact(tv, &file_path, opts, Some(ctx.pr.as_ref()))?;
 
         if let Some(bins) = self.get_filter_bins(tv) {
@@ -502,6 +505,13 @@ impl UnifiedGitBackend {
             return Ok(vec![bin_path]);
         }
 
+        // Check for macOS .app bundle structure at root (happens when auto-strip removed .app wrapper)
+        // Look for Contents/MacOS/ which indicates a stripped .app bundle
+        let contents_macos = tv.install_path().join("Contents").join("MacOS");
+        if contents_macos.is_dir() {
+            return Ok(vec![contents_macos]);
+        }
+
         // Check if the root directory contains an executable file
         // If so, use the root directory as a bin path
         if let Ok(entries) = std::fs::read_dir(tv.install_path()) {
@@ -519,6 +529,15 @@ impl UnifiedGitBackend {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
+                    // Check for macOS .app bundles (e.g., SwiftFormat.app/Contents/MacOS/)
+                    let path_str = path.file_name().unwrap_or_default().to_string_lossy();
+                    if path_str.ends_with(".app") {
+                        let macos_dir = path.join("Contents").join("MacOS");
+                        if macos_dir.is_dir() {
+                            paths.push(macos_dir);
+                            continue;
+                        }
+                    }
                     // Check for {subdir}/bin
                     let sub_bin_path = path.join("bin");
                     if sub_bin_path.exists() {
@@ -598,12 +617,18 @@ impl UnifiedGitBackend {
             })
             .await
         } else {
-            try_with_v_prefix(version, version_prefix, |candidate| async move {
-                self.resolve_github_asset_url_for_target(
-                    tv, opts, repo, api_url, &candidate, target,
-                )
-                .await
-            })
+            // Pass full repo for trying reponame@version formats
+            try_with_v_prefix_and_repo(
+                version,
+                version_prefix,
+                Some(repo),
+                |candidate| async move {
+                    self.resolve_github_asset_url_for_target(
+                        tv, opts, repo, api_url, &candidate, target,
+                    )
+                    .await
+                },
+            )
             .await
         }
     }
@@ -664,7 +689,15 @@ impl UnifiedGitBackend {
         }
 
         // Fall back to auto-detection for target platform
-        let asset_name = asset_matcher::detect_asset_for_target(&available_assets, target)?;
+        let no_app = opts
+            .get("no_app")
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(false);
+        let asset_name = asset_matcher::AssetMatcher::new()
+            .for_target(target)
+            .with_no_app(no_app)
+            .pick_from(&available_assets)?
+            .name;
         let asset = self
             .find_asset_case_insensitive(&release.assets, &asset_name, |a| &a.name)
             .ok_or_else(|| {
@@ -751,7 +784,15 @@ impl UnifiedGitBackend {
         }
 
         // Fall back to auto-detection for target platform
-        let asset_name = asset_matcher::detect_asset_for_target(&available_assets, target)?;
+        let no_app = opts
+            .get("no_app")
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(false);
+        let asset_name = asset_matcher::AssetMatcher::new()
+            .for_target(target)
+            .with_no_app(no_app)
+            .pick_from(&available_assets)?
+            .name;
         let asset = self
             .find_asset_case_insensitive(&release.assets.links, &asset_name, |a| &a.name)
             .ok_or_else(|| {
@@ -837,7 +878,15 @@ impl UnifiedGitBackend {
         }
 
         // Fall back to auto-detection for target platform
-        let asset_name = asset_matcher::detect_asset_for_target(&available_assets, target)?;
+        let no_app = opts
+            .get("no_app")
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(false);
+        let asset_name = asset_matcher::AssetMatcher::new()
+            .for_target(target)
+            .with_no_app(no_app)
+            .pick_from(&available_assets)?
+            .name;
         let asset = self
             .find_asset_case_insensitive(&release.assets, &asset_name, |a| &a.name)
             .ok_or_else(|| {
@@ -894,14 +943,28 @@ impl UnifiedGitBackend {
         }
     }
 
-    fn strip_version_prefix(&self, tag_name: &str) -> String {
-        let opts = self.ba.opts();
-
+    fn strip_version_prefix(&self, tag_name: &str, opts: &ToolVersionOptions) -> String {
         // If a custom version_prefix is configured, strip it first
         if let Some(prefix) = opts.get("version_prefix")
             && let Some(stripped) = tag_name.strip_prefix(prefix)
         {
             return stripped.to_string();
+        }
+
+        // Handle projectname@version format (e.g., "tectonic@0.15.0" -> "0.15.0")
+        // Only strip if the prefix matches the repo short name or full repo name to ensure
+        // we can reconstruct the tag later during installation. For repos with multiple
+        // packages (e.g., tectonic@ and tectonic_xetex_layout@), users must configure
+        // version_prefix to install packages that don't match the repo name.
+        if let Some(caps) = regex!(r"^([^@]+)@(\d.*)$").captures(tag_name) {
+            let prefix = caps.get(1).unwrap().as_str();
+            let version = caps.get(2).unwrap().as_str();
+            let repo = self.repo();
+            let repo_short_name = repo.split('/').next_back();
+            // Strip if prefix matches repo short name OR full repo name
+            if repo_short_name == Some(prefix) || repo == prefix {
+                return version.to_string();
+            }
         }
 
         // Fall back to stripping 'v' prefix
@@ -1093,6 +1156,8 @@ impl UnifiedGitBackend {
         {
             Ok(verified) => {
                 if verified {
+                    ctx.pr
+                        .set_message("✓ GitHub attestations verified".to_string());
                     debug!("GitHub attestations verified successfully for {tv}");
                 }
                 Ok(verified)
@@ -1129,33 +1194,41 @@ impl UnifiedGitBackend {
 
         // Try to get the release (with version prefix support)
         let version_prefix = opts.get("version_prefix").map(|s| s.as_str());
-        let release = match try_with_v_prefix(version, version_prefix, |candidate| {
-            let api_url = api_url.clone();
-            let repo = repo.clone();
-            async move { github::get_release_for_url(&api_url, &repo, &candidate).await }
-        })
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                return Err(VerificationStatus::Error(format!(
-                    "Failed to get release: {e}"
-                )));
-            }
-        };
+        let release =
+            match try_with_v_prefix_and_repo(version, version_prefix, Some(&repo), |candidate| {
+                let api_url = api_url.clone();
+                let repo = repo.clone();
+                async move { github::get_release_for_url(&api_url, &repo, &candidate).await }
+            })
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    return Err(VerificationStatus::Error(format!(
+                        "Failed to get release: {e}"
+                    )));
+                }
+            };
 
-        // Find provenance assets in the release
-        let provenance_asset = release.assets.iter().find(|a| {
-            let name = a.name.to_lowercase();
-            name.contains(".intoto.jsonl")
-                || name.contains("provenance")
-                || name.ends_with(".attestation")
-        });
+        // Find the best provenance asset for the current platform
+        let asset_names: Vec<String> = release.assets.iter().map(|a| a.name.clone()).collect();
+        let current_platform = PlatformTarget::from_current();
+        let picker = AssetPicker::with_libc(
+            current_platform.os_name().to_string(),
+            current_platform.arch_name().to_string(),
+            current_platform.qualifier().map(|s| s.to_string()),
+        );
 
-        let provenance_asset = match provenance_asset {
-            Some(a) => a,
+        let provenance_name = match picker.pick_best_provenance(&asset_names) {
+            Some(name) => name,
             None => return Err(VerificationStatus::NoAttestations),
         };
+
+        let provenance_asset = release
+            .assets
+            .iter()
+            .find(|a| a.name == provenance_name)
+            .expect("provenance asset should exist since we found its name");
 
         // Download the provenance file
         let download_dir = tv.download_path();
@@ -1192,7 +1265,14 @@ impl UnifiedGitBackend {
                 }
                 Ok(verified)
             }
-            Err(e) => Err(VerificationStatus::Error(e.to_string())),
+            Err(e) => {
+                if is_slsa_format_issue(&e) {
+                    debug!("SLSA provenance file not in verifiable format for {tv}: {e}");
+                    Err(VerificationStatus::NoAttestations)
+                } else {
+                    Err(VerificationStatus::Error(e.to_string()))
+                }
+            }
         }
     }
 }
@@ -1236,6 +1316,7 @@ fn template_string_for_target(template: &str, tv: &ToolVersion, target: &Platfor
     if has_legacy_placeholder {
         deprecated_at!(
             "2026.3.0",
+            "2027.3.0",
             "legacy-version-template",
             "Use Tera syntax (e.g., {{{{ version }}}}) instead of legacy {{version}} in templates"
         );
@@ -1260,7 +1341,22 @@ fn template_string_for_target(template: &str, tv: &ToolVersion, target: &Platfor
     ctx.insert("x86_64_arch", x86_64_arch);
     ctx.insert("gnu_arch", gnu_arch);
 
-    match crate::tera::get_tera(None).render_str(template, &ctx) {
+    let mut tera = crate::tera::get_tera(None);
+    // Register target-aware os() and arch() functions that use the target platform
+    // instead of the compile-time platform
+    let make_remapping_fn = |value: String| {
+        move |args: &HashMap<String, tera::Value>| -> tera::Result<tera::Value> {
+            if let Some(s) = args.get(value.as_str()).and_then(|v| v.as_str()) {
+                Ok(tera::Value::String(s.to_string()))
+            } else {
+                Ok(tera::Value::String(value.clone()))
+            }
+        }
+    };
+    tera.register_function("os", make_remapping_fn(os.to_string()));
+    tera.register_function("arch", make_remapping_fn(arch.to_string()));
+
+    match tera.render_str(template, &ctx) {
         Ok(rendered) => rendered,
         Err(e) => {
             warn!("Failed to render template '{}': {}", template, e);
@@ -1290,25 +1386,56 @@ mod tests {
 
     #[test]
     fn test_version_prefix_functionality() {
-        let mut backend = create_test_backend();
+        let backend = create_test_backend();
+        let default_opts = ToolVersionOptions::default();
 
         // Test with no version prefix configured
-        assert_eq!(backend.strip_version_prefix("v1.0.0"), "1.0.0");
-        assert_eq!(backend.strip_version_prefix("1.0.0"), "1.0.0");
+        assert_eq!(
+            backend.strip_version_prefix("v1.0.0", &default_opts),
+            "1.0.0"
+        );
+        assert_eq!(
+            backend.strip_version_prefix("1.0.0", &default_opts),
+            "1.0.0"
+        );
+
+        // Test projectname@version format - only strips if prefix matches repo name
+        // Backend uses "github:test/repo" so repo short name is "repo", full name is "test/repo"
+        assert_eq!(
+            backend.strip_version_prefix("repo@0.15.0", &default_opts),
+            "0.15.0"
+        );
+        assert_eq!(
+            backend.strip_version_prefix("repo@1.2.3", &default_opts),
+            "1.2.3"
+        );
+        // Also accepts full repo name as prefix
+        assert_eq!(
+            backend.strip_version_prefix("test/repo@2.0.0", &default_opts),
+            "2.0.0"
+        );
+        // Should NOT strip if prefix doesn't match repo name (prevents listing
+        // versions that can't be installed)
+        assert_eq!(
+            backend.strip_version_prefix("other_package@0.15.0", &default_opts),
+            "other_package@0.15.0"
+        );
+        // Should not match if part after @ doesn't start with a digit
+        assert_eq!(
+            backend.strip_version_prefix("repo@beta", &default_opts),
+            "repo@beta"
+        );
 
         // Test with custom version prefix
         let mut opts = ToolVersionOptions::default();
         opts.opts
             .insert("version_prefix".to_string(), "release-".to_string());
-        backend.ba = Arc::new(BackendArg::new_raw(
-            "test".to_string(),
-            Some("github:test/repo".to_string()),
-            "test".to_string(),
-            Some(opts),
-        ));
 
-        assert_eq!(backend.strip_version_prefix("release-1.0.0"), "1.0.0");
-        assert_eq!(backend.strip_version_prefix("1.0.0"), "1.0.0");
+        assert_eq!(
+            backend.strip_version_prefix("release-1.0.0", &opts),
+            "1.0.0"
+        );
+        assert_eq!(backend.strip_version_prefix("1.0.0", &opts), "1.0.0");
     }
 
     #[test]
@@ -1362,5 +1489,60 @@ mod tests {
         let result =
             backend.find_asset_case_insensitive(&assets, "nonexistent-asset.tar.gz", |a| &a.name);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_is_slsa_format_issue_no_attestations() {
+        let err = sigstore_verification::AttestationError::NoAttestations;
+        assert!(is_slsa_format_issue(&err));
+    }
+
+    #[test]
+    fn test_is_slsa_format_issue_invalid_format() {
+        // This is the exact error from BuildKit raw provenance files parsed line-by-line
+        let err = sigstore_verification::AttestationError::Verification(
+            "File does not contain valid attestations or SLSA provenance".to_string(),
+        );
+        assert!(is_slsa_format_issue(&err));
+    }
+
+    #[test]
+    fn test_is_slsa_format_issue_no_certificate() {
+        let err = sigstore_verification::AttestationError::Verification(
+            "No certificate found in attestation bundle".to_string(),
+        );
+        assert!(is_slsa_format_issue(&err));
+    }
+
+    #[test]
+    fn test_is_slsa_format_issue_no_dsse_envelope() {
+        let err = sigstore_verification::AttestationError::Verification(
+            "Bundle has neither DSSE envelope nor message signature".to_string(),
+        );
+        assert!(is_slsa_format_issue(&err));
+    }
+
+    #[test]
+    fn test_is_slsa_format_issue_real_verification_failure() {
+        // Digest mismatch = real verification failure, NOT a format issue
+        let err = sigstore_verification::AttestationError::Verification(
+            "Artifact digest mismatch: expected abc123".to_string(),
+        );
+        assert!(!is_slsa_format_issue(&err));
+    }
+
+    #[test]
+    fn test_is_slsa_format_issue_signature_failure() {
+        // Signature verification failure = real failure, NOT a format issue
+        let err = sigstore_verification::AttestationError::Verification(
+            "P-256 signature verification failed: invalid signature".to_string(),
+        );
+        assert!(!is_slsa_format_issue(&err));
+    }
+
+    #[test]
+    fn test_is_slsa_format_issue_api_error() {
+        let err = sigstore_verification::AttestationError::Api("connection refused".to_string());
+        assert!(!is_slsa_format_issue(&err));
     }
 }

@@ -16,10 +16,10 @@ use crate::cli::args::BackendArg;
 use crate::cmd::CmdLineRunner;
 use crate::config::{Config, Settings};
 use crate::env::GITHUB_TOKEN;
+use crate::file;
 use crate::http::HTTP_FETCH;
 use crate::install_context::InstallContext;
 use crate::toolset::{ToolRequest, ToolVersion};
-use crate::{env, file};
 
 #[derive(Debug)]
 pub struct CargoBackend {
@@ -42,6 +42,12 @@ impl Backend for CargoBackend {
 
     fn get_optional_dependencies(&self) -> eyre::Result<Vec<&str>> {
         Ok(vec!["cargo-binstall", "sccache"])
+    }
+
+    /// Cargo installs packages from crates.io using version specs (e.g., ripgrep@14.0.0).
+    /// It doesn't support installing from direct URLs, so lockfile URLs are not applicable.
+    fn supports_lockfile_url(&self) -> bool {
+        false
     }
 
     async fn _list_remote_versions(&self, _config: &Arc<Config>) -> eyre::Result<Vec<VersionInfo>> {
@@ -113,8 +119,8 @@ impl Backend for CargoBackend {
                 cmd = cmd.env("GITHUB_TOKEN", token)
             }
             cmd.arg(install_arg)
-        } else if env::var("MISE_CARGO_BINSTALL_ONLY").is_ok_and(|v| v == "1") {
-            bail!("cargo-binstall is not available, but MISE_CARGO_BINSTALL_ONLY is set");
+        } else if Settings::get().cargo.binstall_only {
+            bail!("cargo-binstall is not available, but cargo.binstall_only is set");
         } else {
             cmd.arg(install_arg)
         };

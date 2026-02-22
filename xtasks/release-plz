@@ -12,10 +12,20 @@ fi
 git config user.name mise-en-dev
 git config user.email release@mise.jdx.dev
 
+# Check if the most recent tag has a matching GitHub Release.
+# If not, the previous release workflow likely failed to fire — re-trigger it.
+latest_tag="$(git tag --list 'v[0-9]*' --sort=-v:refname | head -1 || true)"
+if [[ -n $latest_tag ]]; then
+	if ! gh api "repos/$GITHUB_REPOSITORY/releases/tags/$latest_tag" --silent 2>/dev/null; then
+		echo "Tag $latest_tag has no GitHub Release — triggering release workflow"
+		gh workflow run release.yml --ref "$latest_tag"
+	fi
+fi
+
 exists_on_crates() {
 	crate="$1"
 	version="$2"
-	if cargo info --registry "crates-io" --color never --quiet "$crate" | grep -E "^version:\s+$version$" >/dev/null 2>&1; then
+	if cargo info --registry "crates-io" --color never --quiet "$crate@$version" 2>/dev/null | grep -qE "^version:\s+$version\b"; then
 		return 0
 	fi
 	if curl -fsSL "https://crates.io/api/v1/crates/$crate/$version" >/dev/null 2>&1; then
@@ -32,7 +42,7 @@ has_crate_changes() {
 
 	# Get the latest tag for this crate
 	local latest_tag
-	latest_tag=$(git tag --list "${crate_name}-v*" --sort=-v:refname | head -1)
+	latest_tag=$(git tag --list "${crate_name}-v*" --sort=-v:refname | head -1 || true)
 
 	if [[ -z $latest_tag ]]; then
 		echo "No previous tag found for $crate_name, will publish"
@@ -172,12 +182,19 @@ if [[ $cur_version != "$latest_version" ]]; then
 	# Handle subcrates with independent versioning
 	VFOX_VERSION=""
 	AQUA_REGISTRY_VERSION=""
+	INTERACTIVE_CONFIG_VERSION=""
 
 	bump_and_publish_subcrate "vfox" "crates/vfox" "VFOX_VERSION"
 	cargo add "vfox@$VFOX_VERSION"
 
 	bump_and_publish_subcrate "aqua-registry" "crates/aqua-registry" "AQUA_REGISTRY_VERSION"
 	cargo add "aqua-registry@$AQUA_REGISTRY_VERSION"
+
+	# Copy schema into crate directory so cargo publish verification can find it
+	cp schema/mise.json crates/mise-interactive-config/mise.json
+	bump_and_publish_subcrate "mise-interactive-config" "crates/mise-interactive-config" "INTERACTIVE_CONFIG_VERSION"
+	rm -f crates/mise-interactive-config/mise.json
+	cargo add "mise-interactive-config@$INTERACTIVE_CONFIG_VERSION"
 
 	if exists_on_crates mise "$cur_version"; then
 		echo "mise@$cur_version already on crates.io, skipping publish"
@@ -268,7 +285,9 @@ AQUA_CHANGELOG_PR="$(./scripts/gen-aqua-changelog.sh "$OLD_AQUA_PKGS" "$NEW_AQUA
 
 # Generate changelog using git-cliff with explicit calver version (not --bump which uses semver)
 # LLM editorialization happens in release.yml after merge
-git cliff --tag "v$version" -o CHANGELOG.md
+# Use --unreleased --prepend to only add the new release entry, preserving existing content
+# (including previously injected aqua-registry sections from older releases)
+git cliff --tag "v$version" --unreleased --prepend CHANGELOG.md
 
 # Get the unreleased notes for PR body (strip version header since PR title has version)
 PR_NOTES="$(git cliff --tag "v$version" --unreleased --strip all | tail -n +3)"
@@ -283,6 +302,7 @@ if [[ -n $AQUA_CHANGELOG_MD ]]; then
 			if (release_count == 1 && !inserted) {
 				# We are at the second release, inject aqua section before it
 				print ENVIRON["AQUA_CHANGELOG_MD"]
+				print ""
 				inserted = 1
 			}
 			release_count++
@@ -291,6 +311,7 @@ if [[ -n $AQUA_CHANGELOG_MD ]]; then
 		END {
 			# If we never hit a second release (only one release in file), append at end
 			if (release_count == 1 && !inserted) {
+				print ""
 				print ENVIRON["AQUA_CHANGELOG_MD"]
 			}
 		}
@@ -299,10 +320,13 @@ fi
 
 mise up
 mise lock
+# Refresh PATH after mise up, since upgraded tools have new install paths
+eval "$(mise env)"
 
 # Update embedded vfox plugins (delete all and re-clone fresh, similar to aqua-registry)
 EMBEDDED_PLUGINS_DIR="crates/vfox/embedded-plugins"
-rm -rf "$EMBEDDED_PLUGINS_DIR"/vfox-*
+rm -rf "$EMBEDDED_PLUGINS_DIR"
+mkdir -p "$EMBEDDED_PLUGINS_DIR"
 
 # Clone all tools where vfox is the FIRST (default) backend
 mise registry | awk '$2 ~ /^vfox:/ {print $2}' | sed 's|vfox:||' | sort -u | while read -r repo_path; do
@@ -324,6 +348,7 @@ done
 # Bump subcrate versions if they have changes (from aqua-registry/vfox updates)
 bump_subcrate_if_changed "aqua-registry" "crates/aqua-registry"
 bump_subcrate_if_changed "vfox" "crates/vfox"
+bump_subcrate_if_changed "mise-interactive-config" "crates/mise-interactive-config"
 
 git status
 # cargo update
@@ -336,6 +361,7 @@ git add \
 	crates/aqua-registry/Cargo.toml \
 	crates/vfox/embedded-plugins \
 	crates/vfox/Cargo.toml \
+	crates/mise-interactive-config/Cargo.toml \
 	default.nix \
 	snapcraft.yaml \
 	docs/.vitepress/stars.data.ts \

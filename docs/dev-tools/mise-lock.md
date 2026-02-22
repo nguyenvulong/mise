@@ -1,4 +1,4 @@
-# mise.lock Lockfile <Badge type="warning" text="experimental" />
+# mise.lock Lockfile
 
 `mise.lock` is a lockfile that pins exact versions and checksums of tools for reproducible environments. When enabled, mise will automatically maintain this file to ensure consistent tool versions across different machines and deployments.
 
@@ -230,7 +230,7 @@ git commit -m "Update tool versions"
     mise install  # Uses exact versions from mise.lock
 
 - name: Cache lockfile
-  uses: actions/cache@v3
+  uses: actions/cache@v5
   with:
     key: mise-lock-${{ hashFiles('mise.lock') }}
 ```
@@ -281,15 +281,6 @@ mise install
 ```sh
 # Set versions based on package.json
 mise use node@$(jq -r '.engines.node' package.json)
-```
-
-## Experimental Features
-
-Since lockfiles are still experimental, enable them with:
-
-```sh
-mise settings experimental=true
-mise settings lockfile=true
 ```
 
 ## See Also

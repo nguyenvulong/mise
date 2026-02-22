@@ -104,7 +104,7 @@ impl TaskExecutor {
     pub fn task_timings(&self) -> bool {
         let output_mode = self.output_handler.output(None);
         self.timings
-            || Settings::get().task_timings.unwrap_or(
+            || Settings::get().task.timings.unwrap_or(
                 output_mode == TaskOutput::Prefix
                     || output_mode == TaskOutput::Timed
                     || output_mode == TaskOutput::KeepOrder,
@@ -119,7 +119,7 @@ impl TaskExecutor {
     ) -> Result<()> {
         let prefix = task.estyled_prefix();
         let total_start = std::time::Instant::now();
-        if Settings::get().task_skip.contains(&task.name) {
+        if Settings::get().task.skip.contains(&task.name) {
             if !self.quiet(Some(task)) {
                 self.eprint(task, &prefix, "skipping task");
             }
@@ -130,12 +130,6 @@ impl TaskExecutor {
                 self.eprint(task, &prefix, "sources up-to-date, skipping");
             }
             return Ok(());
-        }
-        if let Some(message) = &task.confirm
-            && !Settings::get().yes
-            && !crate::ui::confirm(message).unwrap_or(false)
-        {
-            return Err(eyre!("aborted by user"));
         }
 
         let mut tools = self.tool.clone();
@@ -183,6 +177,10 @@ impl TaskExecutor {
         );
         if !self.timings {
             env.insert("MISE_TASK_TIMINGS".to_string(), "0".to_string());
+        }
+        // Propagate MISE_ENV to child tasks so -E flag works for nested mise invocations
+        if !crate::env::MISE_ENV.is_empty() {
+            env.insert("MISE_ENV".to_string(), crate::env::MISE_ENV.join(","));
         }
         if let Some(cwd) = &*crate::dirs::CWD {
             env.insert("MISE_ORIGINAL_CWD".into(), cwd.display().to_string());
@@ -236,6 +234,9 @@ impl TaskExecutor {
             self.parse_usage_spec_and_init_env(config, task, &mut env, get_args)
                 .await?;
 
+            // Check confirmation after usage args are parsed
+            self.check_confirmation(config, task, &env).await?;
+
             let exec_start = std::time::Instant::now();
             self.exec_task_run_entries(
                 config,
@@ -264,7 +265,7 @@ impl TaskExecutor {
             );
         }
 
-        save_checksum(task)?;
+        save_checksum(task, config).await?;
 
         Ok(())
     }
@@ -463,7 +464,7 @@ impl TaskExecutor {
         let script = script.trim_start();
         let cmd = format!("$ {script} {args}", args = args.join(" ")).to_string();
         if !self.quiet(Some(task)) {
-            let msg = style::ebold(trunc(prefix, config.redact(cmd).trim()))
+            let msg = style::ebold(trunc(prefix, config.redact(&cmd).trim()))
                 .bright()
                 .to_string();
             self.eprint(task, prefix, &msg)
@@ -489,18 +490,13 @@ impl TaskExecutor {
         args: &[String],
     ) -> Result<(String, Vec<String>)> {
         let display = file.display().to_string();
-        if is_executable(file) && !Settings::get().use_file_shell_for_executable_tasks {
-            if cfg!(windows) && file.extension().is_some_and(|e| e == "ps1") {
-                let args = vec!["-File".to_string(), display]
-                    .into_iter()
-                    .chain(args.iter().cloned())
-                    .collect_vec();
-                return Ok(("pwsh".to_string(), args));
-            }
+        if !Settings::get().use_file_shell_for_executable_tasks && can_execute_directly(file) {
             return Ok((display, args.to_vec()));
         }
         let shell = task
             .shell()
+            .or_else(|| shell_from_shebang(file))
+            .or_else(|| shell_from_extension(file))
             .unwrap_or(Settings::get().default_file_shell()?);
         trace!("using shell: {}", shell.join(" "));
         let mut full_args = shell.clone();
@@ -561,12 +557,15 @@ impl TaskExecutor {
         self.parse_usage_spec_and_init_env(config, task, &mut env, get_args)
             .await?;
 
+        // Check confirmation after usage args are parsed
+        self.check_confirmation(config, task, &env).await?;
+
         if !self.quiet(Some(task)) {
             let cmd = format!("{} {}", display_path(file), args.join(" "))
                 .trim()
                 .to_string();
             let cmd = style::ebold(format!("$ {cmd}")).bright().to_string();
-            let cmd = trunc(prefix, config.redact(cmd).trim());
+            let cmd = trunc(prefix, config.redact(&cmd).trim());
             self.eprint(task, prefix, &cmd);
         }
 
@@ -670,27 +669,27 @@ impl TaskExecutor {
             }
             TaskOutput::KeepOrder => {
                 if !task.silent.suppresses_stdout() {
-                    cmd = cmd.with_on_stdout(|line| {
-                        let mut map = self.output_handler.keep_order_output.lock().unwrap();
-                        if !map.contains_key(task) {
-                            map.insert(task.clone(), Default::default());
-                        }
-                        if let Some(entry) = map.get_mut(task) {
-                            entry.0.push((prefix.to_string(), line));
-                        }
+                    let state = self.output_handler.keep_order_state.clone();
+                    let task_clone = task.clone();
+                    let prefix_str = prefix.to_string();
+                    cmd = cmd.with_on_stdout(move |line| {
+                        state
+                            .lock()
+                            .unwrap()
+                            .on_stdout(&task_clone, prefix_str.clone(), line);
                     });
                 } else {
                     cmd = cmd.stdout(Stdio::null());
                 }
                 if !task.silent.suppresses_stderr() {
-                    cmd = cmd.with_on_stderr(|line| {
-                        let mut map = self.output_handler.keep_order_output.lock().unwrap();
-                        if !map.contains_key(task) {
-                            map.insert(task.clone(), Default::default());
-                        }
-                        if let Some(entry) = map.get_mut(task) {
-                            entry.1.push((prefix.to_string(), line));
-                        }
+                    let state = self.output_handler.keep_order_state.clone();
+                    let task_clone = task.clone();
+                    let prefix_str = prefix.to_string();
+                    cmd = cmd.with_on_stderr(move |line| {
+                        state
+                            .lock()
+                            .unwrap()
+                            .on_stderr(&task_clone, prefix_str.clone(), line);
                     });
                 } else {
                     cmd = cmd.stderr(Stdio::null());
@@ -793,6 +792,36 @@ impl TaskExecutor {
         false
     }
 
+    async fn check_confirmation(
+        &self,
+        config: &Arc<Config>,
+        task: &Task,
+        env: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        if let Some(confirm_template) = &task.confirm
+            && !Settings::get().yes
+        {
+            let config_root = task.config_root.clone().unwrap_or_default();
+            let mut tera = crate::tera::get_tera(Some(&config_root));
+            let mut tera_ctx = task.tera_ctx(config).await?;
+
+            // Add usage values from parsed environment
+            let mut usage_ctx = std::collections::HashMap::new();
+            for (key, value) in env {
+                if let Some(usage_key) = key.strip_prefix("usage_") {
+                    usage_ctx.insert(usage_key.to_string(), tera::Value::String(value.clone()));
+                }
+            }
+            tera_ctx.insert("usage", &usage_ctx);
+
+            let message = tera.render_str(confirm_template, &tera_ctx)?;
+            if !crate::ui::confirm(&message).unwrap_or(false) {
+                return Err(eyre!("aborted by user"));
+            }
+        }
+        Ok(())
+    }
+
     async fn parse_usage_spec_and_init_env(
         &self,
         config: &Arc<Config>,
@@ -804,7 +833,13 @@ impl TaskExecutor {
         if !spec.cmd.args.is_empty() || !spec.cmd.flags.is_empty() {
             let args: Vec<String> = get_args();
             trace!("Parsing usage spec for {:?}", args);
-            let po = usage::parse(&spec, &args).map_err(|err| eyre!(err))?;
+            // Pass env vars to Parser so it can resolve env= defaults in usage specs
+            let env_map: std::collections::HashMap<String, String> =
+                env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            let po = usage::Parser::new(&spec)
+                .with_env(env_map)
+                .parse(&args)
+                .map_err(|err| eyre!(err))?;
             for (k, v) in po.as_env() {
                 trace!("Adding key {} value {} in env", k, v);
                 env.insert(k, v);
@@ -815,4 +850,56 @@ impl TaskExecutor {
 
         Ok(())
     }
+}
+
+/// Check if a file can be executed directly by the OS without a shell wrapper.
+/// On Unix, this checks the executable permission bit.
+/// On Windows, this checks for a known executable extension (.bat, .ps1, etc.)
+/// — shebang-only files need to be run through a shell.
+fn can_execute_directly(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        // .ps1 files need pwsh -File, they can't be executed directly
+        if path.extension().is_some_and(|e| e == "ps1") {
+            return false;
+        }
+        crate::file::has_known_executable_extension(path)
+    }
+    #[cfg(not(windows))]
+    {
+        is_executable(path)
+    }
+}
+
+/// Determine the shell from a file's extension.
+/// e.g. `.ps1` → `["pwsh", "-File"]`
+fn shell_from_extension(path: &Path) -> Option<Vec<String>> {
+    match path.extension()?.to_str()? {
+        "ps1" => Some(vec!["pwsh".to_string(), "-File".to_string()]),
+        _ => None,
+    }
+}
+
+/// Read the shebang from a file and parse it into a shell command.
+/// e.g. `#!/usr/bin/env bash` → `["bash"]`
+/// e.g. `#!/bin/bash` → `["/bin/bash"]`
+fn shell_from_shebang(path: &Path) -> Option<Vec<String>> {
+    use std::io::{BufRead, BufReader};
+    let f = std::fs::File::open(path).ok()?;
+    let mut reader = BufReader::new(f);
+    let mut first_line = String::new();
+    reader.read_line(&mut first_line).ok()?;
+    let shebang = first_line.strip_prefix("#!")?;
+    let shebang = shebang.strip_prefix("/usr/bin/env -S").unwrap_or(shebang);
+    let shebang = shebang.strip_prefix("/usr/bin/env").unwrap_or(shebang);
+    let mut parts = shebang.split_whitespace();
+    let shell = parts.next()?;
+    // On Windows, convert unix paths like /bin/bash to just the binary name
+    let shell = if cfg!(windows) {
+        shell.rsplit('/').next().unwrap_or(shell)
+    } else {
+        shell
+    };
+    let args: Vec<String> = parts.map(|s| s.to_string()).collect();
+    Some(once(shell.to_string()).chain(args).collect())
 }

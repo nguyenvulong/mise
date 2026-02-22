@@ -7,25 +7,28 @@ import * as fs from "node:fs";
 import * as child_process from "node:child_process";
 import * as toml from "toml";
 
+type EnumValue = string | boolean | number;
+type EnumItem = EnumValue | { value: EnumValue; description?: string };
+
 type Props = {
   type: string;
   description: string;
   default?: unknown;
   deprecated?: string;
-  enum?: [string, ...string[]][];
+  enum?: EnumItem[];
   rc?: boolean;
 };
 
 type SettingsToml = Record<string, Props | Record<string, Props>>;
 
 type Element = {
-  type: string;
+  type: string | string[];
   default: unknown;
   description: string;
   deprecated?: true;
-  enum?: string[];
+  enum?: EnumValue[];
   items?: {
-    type: string;
+    type: string | string[];
   };
   additionalProperties?: {
     type: string;
@@ -40,7 +43,7 @@ type NestedElement = {
 };
 
 function buildElement(key: string, props: Props): Element {
-  const typeMap: Record<string, string> = {
+  const typeMap: Record<string, string | string[]> = {
     String: "string",
     Path: "string",
     Url: "string",
@@ -51,6 +54,7 @@ function buildElement(key: string, props: Props): Element {
     ListPath: "string[]",
     SetString: "string[]",
     "IndexMap<String, String>": "object",
+    BoolOrString: ["boolean", "string"],
   };
   const type = props.type ? typeMap[props.type] : undefined;
   if (!type) {
@@ -71,7 +75,9 @@ function buildElement(key: string, props: Props): Element {
     element.deprecated = true;
   }
   if (props.enum) {
-    element.enum = props.enum.map((e) => e[0]);
+    element.enum = props.enum.map((e) =>
+      typeof e === "object" && e !== null && "value" in e ? e.value : e,
+    );
   }
 
   if (type === "string[]") {
@@ -123,6 +129,36 @@ for (const key in doc) {
 
 const schema = JSON.parse(fs.readFileSync("schema/mise.json", "utf-8"));
 schema["$defs"].settings.properties = settings;
+
+// Generate task and task_template from task_props to avoid unevaluatedProperties
+// (which Tombi doesn't support) while keeping extends only on tasks, not templates.
+const taskProps = schema["$defs"].task_props;
+
+// task_template: task_props + additionalProperties: false
+schema["$defs"].task_template = {
+  description: "task template that can be extended by tasks",
+  properties: { ...taskProps.properties },
+  additionalProperties: false,
+  type: "object",
+};
+
+// task (object variant): task_props + extends + additionalProperties: false
+const taskObjectVariant = {
+  properties: {
+    ...taskProps.properties,
+    extends: {
+      description: "name of the task template to extend",
+      type: "string",
+    },
+  },
+  additionalProperties: false,
+  type: "object",
+};
+
+// Overwrite the object variant (last entry) in task oneOf with inlined properties
+const taskDef = schema["$defs"].task;
+taskDef.oneOf[taskDef.oneOf.length - 1] = taskObjectVariant;
+
 fs.writeFileSync("schema/mise.json.tmp", JSON.stringify(schema));
 
 child_process.execSync("jq . < schema/mise.json.tmp > schema/mise.json");
@@ -136,6 +172,8 @@ taskSchema["$defs"].env_directive = schema["$defs"].env_directive;
 taskSchema["$defs"].env = schema["$defs"].env;
 taskSchema["$defs"].task_run_entry = schema["$defs"].task_run_entry;
 taskSchema["$defs"].task = schema["$defs"].task;
+taskSchema["$defs"].task_template = schema["$defs"].task_template;
+delete taskSchema["$defs"].task_props;
 fs.writeFileSync("schema/mise-task.json.tmp", JSON.stringify(taskSchema));
 child_process.execSync(
   "jq . < schema/mise-task.json.tmp > schema/mise-task.json",

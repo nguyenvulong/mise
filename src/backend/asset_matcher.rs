@@ -6,14 +6,12 @@
 //! # Example
 //!
 //! ```ignore
-//! use crate::backend::asset_matcher::{AssetMatcher, detect_asset_for_target};
+//! use crate::backend::asset_matcher::AssetMatcher;
 //!
 //! // Auto-detect best asset for a target platform
-//! let asset = detect_asset_for_target(&assets, &target)?;
-//!
-//! // Or use the builder
 //! let asset = AssetMatcher::new()
 //!     .for_target(&target)
+//!     .with_no_app(true) // optional: avoid .app bundles
 //!     .pick_from(&assets)?;
 //! ```
 
@@ -123,7 +121,7 @@ static OS_PATTERNS: LazyLock<Vec<(AssetOs, Regex)>> = LazyLock::new(|| {
         ),
         (
             AssetOs::Windows,
-            Regex::new(r"(?i)(?:\b|_)win(?:32|64|dows)?(?:\b|_)").unwrap(),
+            Regex::new(r"(?i)(?:\b|_)(?:mingw-w64|win(?:32|64|dows)?)(?:\b|_)").unwrap(),
         ),
     ]
 });
@@ -178,6 +176,7 @@ pub struct AssetPicker {
     target_os: String,
     target_arch: String,
     target_libc: String,
+    no_app: bool,
 }
 
 impl AssetPicker {
@@ -197,7 +196,14 @@ impl AssetPicker {
             target_os,
             target_arch,
             target_libc,
+            no_app: false,
         }
+    }
+
+    /// Set whether to avoid .app bundles (prefer standalone CLI tools)
+    pub fn with_no_app(mut self, no_app: bool) -> Self {
+        self.no_app = no_app;
+        self
     }
 
     /// Picks the best asset from available options
@@ -208,6 +214,37 @@ impl AssetPicker {
             .first()
             .filter(|(score, _)| *score > 0)
             .map(|(_, asset)| asset.clone())
+    }
+
+    /// Picks the best provenance file for the current platform from available assets.
+    /// Returns the provenance file that best matches the target OS and architecture.
+    pub fn pick_best_provenance(&self, assets: &[String]) -> Option<String> {
+        // Filter to only provenance files
+        let provenance_assets: Vec<&String> = assets
+            .iter()
+            .filter(|a| {
+                let name = a.to_lowercase();
+                name.contains(".intoto.jsonl")
+                    || name.contains("provenance")
+                    || name.ends_with(".attestation")
+            })
+            .collect();
+
+        if provenance_assets.is_empty() {
+            return None;
+        }
+
+        // Score by platform match only (no format/build penalties)
+        let mut scored: Vec<(i32, &String)> = provenance_assets
+            .into_iter()
+            .map(|asset| {
+                let score = self.score_os_match(asset) + self.score_arch_match(asset);
+                (score, asset)
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.first().map(|(_, asset)| (*asset).clone())
     }
 
     fn score_all_assets(&self, assets: &[String]) -> Vec<(i32, String)> {
@@ -240,6 +277,15 @@ impl AssetPicker {
                 };
             }
         }
+        // Check for Windows-specific file extensions (.msi, .exe)
+        // These should be penalized on non-Windows platforms
+        // See: https://github.com/jdx/mise/discussions/7837
+        let lower = asset.to_lowercase();
+        if (lower.ends_with(".msi") || lower.ends_with(".exe")) && self.target_os != "windows" {
+            return -100;
+        }
+        // On Windows, these are valid but don't need a boost - let other
+        // factors (arch match, format preferences) determine the best asset
         0
     }
 
@@ -296,6 +342,20 @@ impl AssetPicker {
         }
         if asset.ends_with(".artifactbundle") || asset.contains(".artifactbundle.") {
             penalty -= 30;
+        }
+        // Penalize macOS .app bundles on non-macOS platforms
+        if asset.contains(".app.") && self.target_os != "macos" {
+            penalty -= 100;
+        }
+        // Penalize .app bundles if no_app option is set
+        // .app bundles often contain Xcode extensions or GUI apps, not CLI tools
+        if self.no_app && asset.contains(".app.") {
+            penalty -= 50;
+        }
+
+        // Penalize .vsix files
+        if asset.ends_with(".vsix") {
+            penalty -= 100;
         }
 
         // Penalize metadata/checksum/signature files
@@ -422,6 +482,8 @@ pub struct AssetMatcher {
     target_arch: Option<String>,
     /// Target libc variant (e.g., "gnu", "musl")
     target_libc: Option<String>,
+    /// Whether to avoid .app bundles
+    no_app: bool,
 }
 
 impl AssetMatcher {
@@ -435,6 +497,12 @@ impl AssetMatcher {
         self.target_os = Some(target.os_name().to_string());
         self.target_arch = Some(target.arch_name().to_string());
         self.target_libc = target.qualifier().map(|s| s.to_string());
+        self
+    }
+
+    /// Set whether to avoid .app bundles (prefer standalone CLI tools)
+    pub fn with_no_app(mut self, no_app: bool) -> Self {
+        self.no_app = no_app;
         self
     }
 
@@ -481,11 +549,10 @@ impl AssetMatcher {
     fn create_picker(&self) -> Option<AssetPicker> {
         let os = self.target_os.as_ref()?;
         let arch = self.target_arch.as_ref()?;
-        Some(AssetPicker::with_libc(
-            os.clone(),
-            arch.clone(),
-            self.target_libc.clone(),
-        ))
+        Some(
+            AssetPicker::with_libc(os.clone(), arch.clone(), self.target_libc.clone())
+                .with_no_app(self.no_app),
+        )
     }
 
     fn match_by_auto_detection(&self, assets: &[String]) -> Result<MatchedAsset> {
@@ -506,14 +573,6 @@ impl AssetMatcher {
 
         Ok(MatchedAsset { name: best })
     }
-}
-
-/// Convenience function to detect the best asset for a target platform
-pub fn detect_asset_for_target(assets: &[String], target: &PlatformTarget) -> Result<String> {
-    AssetMatcher::new()
-        .for_target(target)
-        .pick_from(assets)
-        .map(|m| m.name)
 }
 
 // ========== Checksum Fetching Helpers ==========
@@ -907,7 +966,7 @@ abc123def456abc123def456abc123def456abc123def456abc123def456abcd  tool-1.0.0-dar
             "tool-1.0.0-linux-x86_64.tar.gz".to_string(),
             "tool-1.0.0-darwin-x86_64.xz".to_string(),
             "tool-1.0.0-darwin-aarch64.xz".to_string(),
-            "tool-1.0.0-windows-x86_64.zip".to_string(),
+            "tool-1.0.0-mingw-w64-x86_64.zip".to_string(),
         ];
 
         let picked = AssetPicker::with_libc("linux".to_string(), "x86_64".to_string(), None)
@@ -919,6 +978,11 @@ abc123def456abc123def456abc123def456abc123def456abc123def456abcd  tool-1.0.0-dar
             .pick_best_asset(&assets)
             .unwrap();
         assert_eq!(picked, "tool-1.0.0-darwin-aarch64.xz");
+
+        let picked = AssetPicker::with_libc("windows".to_string(), "x86_64".to_string(), None)
+            .pick_best_asset(&assets)
+            .unwrap();
+        assert_eq!(picked, "tool-1.0.0-mingw-w64-x86_64.zip");
     }
 
     #[test]
@@ -1206,5 +1270,119 @@ abc123def456abc123def456abc123def456abc123def456abc123def456abcd  tool-darwin.ta
 
         // Metadata should have negative score contribution from penalties
         assert!(score_asc < 0 || score_asc < score_tar - 50);
+    }
+
+    // ========== Provenance Picker Tests ==========
+
+    #[test]
+    fn test_pick_best_provenance_selects_matching_platform() {
+        // Regression test for https://github.com/jdx/mise/discussions/7462
+        // When multiple provenance files exist, select the one matching the target platform
+        let picker = AssetPicker::with_libc("linux".to_string(), "x86_64".to_string(), None);
+        let assets = vec![
+            "buildx-v0.30.1.linux-amd64".to_string(),
+            "buildx-v0.30.1.darwin-amd64.provenance.json".to_string(),
+            "buildx-v0.30.1.linux-amd64.provenance.json".to_string(),
+            "buildx-v0.30.1.windows-amd64.provenance.json".to_string(),
+        ];
+
+        let picked = picker.pick_best_provenance(&assets).unwrap();
+        assert_eq!(
+            picked, "buildx-v0.30.1.linux-amd64.provenance.json",
+            "Should select Linux provenance for Linux target"
+        );
+    }
+
+    #[test]
+    fn test_pick_best_provenance_darwin() {
+        let picker = AssetPicker::with_libc("macos".to_string(), "aarch64".to_string(), None);
+        let assets = vec![
+            "tool-1.0.0-linux-amd64.provenance.json".to_string(),
+            "tool-1.0.0-darwin-arm64.provenance.json".to_string(),
+            "tool-1.0.0-darwin-amd64.provenance.json".to_string(),
+        ];
+
+        let picked = picker.pick_best_provenance(&assets).unwrap();
+        assert_eq!(
+            picked, "tool-1.0.0-darwin-arm64.provenance.json",
+            "Should select darwin-arm64 provenance for macOS arm64 target"
+        );
+    }
+
+    #[test]
+    fn test_pick_best_provenance_windows() {
+        let picker = AssetPicker::with_libc("windows".to_string(), "x86_64".to_string(), None);
+        let assets = vec![
+            "buildkit-v0.26.3.darwin-amd64.provenance.json".to_string(),
+            "buildkit-v0.26.3.linux-amd64.provenance.json".to_string(),
+            "buildkit-v0.26.3.windows-amd64.provenance.json".to_string(),
+            "buildkit-v0.26.3.windows-amd64.tar.gz".to_string(),
+        ];
+
+        let picked = picker.pick_best_provenance(&assets).unwrap();
+        assert_eq!(
+            picked, "buildkit-v0.26.3.windows-amd64.provenance.json",
+            "Should select Windows provenance for Windows target"
+        );
+    }
+
+    #[test]
+    fn test_pick_best_provenance_intoto() {
+        // Test with .intoto.jsonl format (SLSA provenance)
+        let picker = AssetPicker::with_libc("linux".to_string(), "x86_64".to_string(), None);
+        let assets = vec![
+            "tool-linux-amd64.tar.gz".to_string(),
+            "tool-darwin-amd64.intoto.jsonl".to_string(),
+            "tool-linux-amd64.intoto.jsonl".to_string(),
+        ];
+
+        let picked = picker.pick_best_provenance(&assets).unwrap();
+        assert_eq!(
+            picked, "tool-linux-amd64.intoto.jsonl",
+            "Should select Linux .intoto.jsonl for Linux target"
+        );
+    }
+
+    #[test]
+    fn test_pick_best_provenance_none_available() {
+        let picker = AssetPicker::with_libc("linux".to_string(), "x86_64".to_string(), None);
+        let assets = vec![
+            "tool-1.0.0-linux-amd64.tar.gz".to_string(),
+            "tool-1.0.0-linux-amd64.sha256".to_string(),
+        ];
+
+        let picked = picker.pick_best_provenance(&assets);
+        assert!(
+            picked.is_none(),
+            "Should return None when no provenance files exist"
+        );
+    }
+
+    #[test]
+    fn test_pick_best_provenance_single_provenance() {
+        // When only one provenance exists, return it even if platform doesn't match
+        let picker = AssetPicker::with_libc("linux".to_string(), "x86_64".to_string(), None);
+        let assets = vec![
+            "tool-1.0.0-linux-amd64.tar.gz".to_string(),
+            "tool-1.0.0.provenance.json".to_string(), // No platform info
+        ];
+
+        let picked = picker.pick_best_provenance(&assets).unwrap();
+        assert_eq!(
+            picked, "tool-1.0.0.provenance.json",
+            "Should return the only provenance file available"
+        );
+    }
+
+    #[test]
+    fn test_vsix_vs_gz() {
+        let picker = AssetPicker::with_libc("macos".to_string(), "x86_64".to_string(), None);
+        let assets = vec![
+            "rust-analyzer-x86_64-apple-darwin.gz".to_string(),
+            "rust-analyzer-x86_64-apple-darwin.vsix".to_string(),
+        ];
+
+        let picked = picker.pick_best_asset(&assets).unwrap();
+        assert_eq!(picked, "rust-analyzer-x86_64-apple-darwin.gz");
     }
 }

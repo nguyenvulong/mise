@@ -326,7 +326,7 @@ impl Backend for UbiBackend {
             } else {
                 bail!("Invalid checksum: {platform_key}");
             }
-        } else if Settings::get().lockfile && Settings::get().experimental {
+        } else if Settings::get().lockfile {
             ctx.pr
                 .set_message(format!("checksum generate {platform_key}"));
             let hash = hash::file_hash_blake3(file, Some(ctx.pr.as_ref()))?;
@@ -356,6 +356,12 @@ impl Backend for UbiBackend {
                 Ok(vec![tv.install_path()])
             }
         }
+    }
+
+    /// UBI is deprecated in favor of the github backend and doesn't resolve download URLs
+    /// at lock time. Return false so --locked mode doesn't error for ubi tools.
+    fn supports_lockfile_url(&self) -> bool {
+        false
     }
 
     fn resolve_lockfile_options(

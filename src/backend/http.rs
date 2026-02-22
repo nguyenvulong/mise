@@ -3,7 +3,7 @@ use crate::backend::VersionInfo;
 use crate::backend::backend_type::BackendType;
 use crate::backend::static_helpers::{
     clean_binary_name, get_filename_from_url, list_available_platforms_with_key,
-    lookup_platform_key, template_string, verify_artifact,
+    lookup_platform_key, rename_executable_in_dir, template_string, verify_artifact,
 };
 use crate::backend::version_list;
 use crate::cli::args::BackendArg;
@@ -168,6 +168,16 @@ impl HttpBackend {
             parts.push(format!("strip_{strip}"));
         }
 
+        // Include rename_exe in cache key since it modifies the extracted content
+        if let Some(rename) = get_opt(opts, "rename_exe") {
+            parts.push(format!("rename_{rename}"));
+            // When rename_exe is used, bin_path affects where the rename happens,
+            // so different bin_path values result in different cached content
+            if let Some(bin_path) = get_opt(opts, "bin_path") {
+                parts.push(format!("binpath_{bin_path}"));
+            }
+        }
+
         let key = parts.join("_");
         debug!("Cache key: {}", key);
         Ok(key)
@@ -236,6 +246,7 @@ impl HttpBackend {
     /// Extract artifact to cache with atomic rename
     fn extract_to_cache(
         &self,
+        tv: &ToolVersion,
         file_path: &Path,
         cache_key: &str,
         url: &str,
@@ -261,7 +272,7 @@ impl HttpBackend {
         }
 
         // Perform extraction
-        let extraction_type = self.extract_artifact(&tmp_path, file_path, opts, pr)?;
+        let extraction_type = self.extract_artifact(tv, &tmp_path, file_path, opts, pr)?;
 
         // Atomic replace
         if cache_path.exists() {
@@ -278,6 +289,7 @@ impl HttpBackend {
     /// Extract a single artifact to the given directory
     fn extract_artifact(
         &self,
+        tv: &ToolVersion,
         dest: &Path,
         file_path: &Path,
         opts: &ToolVersionOptions,
@@ -292,7 +304,7 @@ impl HttpBackend {
         } else if file_info.format == file::TarFormat::Raw {
             self.extract_raw_file(dest, file_path, &file_info, opts, pr)
         } else {
-            self.extract_archive(dest, file_path, &file_info, opts, pr)
+            self.extract_archive(tv, dest, file_path, &file_info, opts, pr)
         }
     }
 
@@ -308,12 +320,9 @@ impl HttpBackend {
         let filename = self.dest_filename(file_path, file_info, opts);
         let dest_file = dest.join(&filename);
 
-        // Report extraction progress
+        // Report extraction progress (no bytes - we don't know total for extraction)
         if let Some(pr) = pr {
             pr.set_message(format!("extract {}", file_info.file_name()));
-            if let Ok(metadata) = file_path.metadata() {
-                pr.set_length(metadata.len());
-            }
         }
 
         match file_info.extension.as_str() {
@@ -322,13 +331,6 @@ impl HttpBackend {
             "bz2" => file::un_bz2(file_path, &dest_file)?,
             "zst" => file::un_zst(file_path, &dest_file)?,
             _ => unreachable!(),
-        }
-
-        // Mark extraction complete
-        if let Some(pr) = pr
-            && let Ok(metadata) = file_path.metadata()
-        {
-            pr.set_position(metadata.len());
         }
 
         file::make_executable(&dest_file)?;
@@ -347,22 +349,12 @@ impl HttpBackend {
         let filename = self.dest_filename(file_path, file_info, opts);
         let dest_file = dest.join(&filename);
 
-        // Report extraction progress
+        // Report extraction progress (no bytes - we don't know total for extraction)
         if let Some(pr) = pr {
             pr.set_message(format!("extract {}", file_info.file_name()));
-            if let Ok(metadata) = file_path.metadata() {
-                pr.set_length(metadata.len());
-            }
         }
 
         file::copy(file_path, &dest_file)?;
-
-        // Mark extraction complete
-        if let Some(pr) = pr
-            && let Ok(metadata) = file_path.metadata()
-        {
-            pr.set_position(metadata.len());
-        }
 
         file::make_executable(&dest_file)?;
         Ok(ExtractionType::RawFile { filename })
@@ -371,6 +363,7 @@ impl HttpBackend {
     /// Extract an archive (tar, zip, etc.)
     fn extract_archive(
         &self,
+        tv: &ToolVersion,
         dest: &Path,
         file_path: &Path,
         file_info: &FileInfo,
@@ -397,6 +390,20 @@ impl HttpBackend {
         };
 
         file::untar(file_path, dest, &tar_opts)?;
+
+        // Handle rename_exe option for archives
+        if let Some(rename_to) = get_opt(opts, "rename_exe") {
+            let search_dir = if let Some(bin_path_template) = get_opt(opts, "bin_path") {
+                let bin_path = template_string(&bin_path_template, tv);
+                dest.join(&bin_path)
+            } else {
+                dest.to_path_buf()
+            };
+            // rsplit('/') always yields at least one element (the full string if no delimiter)
+            let tool_name = self.ba.tool_name.rsplit('/').next().unwrap();
+            rename_executable_in_dir(&search_dir, &rename_to, Some(tool_name))?;
+        }
+
         Ok(ExtractionType::Archive)
     }
 
@@ -505,7 +512,7 @@ impl HttpBackend {
     ) -> Result<()> {
         let settings = Settings::get();
         let filename = file_path.file_name().unwrap().to_string_lossy();
-        let lockfile_enabled = settings.lockfile && settings.experimental;
+        let lockfile_enabled = settings.lockfile;
 
         let platform_key = self.get_platform_key();
         let platform_info = tv.lock_platforms.entry(platform_key).or_default();
@@ -574,6 +581,7 @@ pub fn install_time_option_keys() -> Vec<String> {
         "version_json_path".into(),
         "version_expr".into(),
         "format".into(),
+        "rename_exe".into(),
     ]
 }
 
@@ -585,6 +593,15 @@ impl Backend for HttpBackend {
 
     fn ba(&self) -> &Arc<BackendArg> {
         &self.ba
+    }
+
+    async fn install_operation_count(&self, tv: &ToolVersion, _ctx: &InstallContext) -> usize {
+        let opts = tv.request.options();
+        super::http_install_operation_count(
+            get_opt(&opts, "checksum").is_some(),
+            &self.get_platform_key(),
+            tv,
+        )
     }
 
     async fn _list_remote_versions(&self, config: &Arc<Config>) -> Result<Vec<VersionInfo>> {
@@ -633,32 +650,23 @@ impl Backend for HttpBackend {
             .or_default()
             .url = Some(url.clone());
 
-        // Determine operation count for progress reporting
-        let mut op_count = 1; // download
-        if get_opt(&opts, "checksum").is_some() {
-            op_count += 1;
-        }
-        op_count += 1; // extraction
-
-        // Account for lockfile checksum verification/generation
+        // For lockfile checksum verification
         let settings = Settings::get();
-        let lockfile_enabled = settings.lockfile && settings.experimental;
+        let lockfile_enabled = settings.lockfile;
         let has_lockfile_checksum = tv
             .lock_platforms
             .get(&platform_key)
             .and_then(|p| p.checksum.as_ref())
             .is_some();
-        if lockfile_enabled || has_lockfile_checksum {
-            op_count += 1;
-        }
-
-        ctx.pr.start_operations(op_count);
 
         ctx.pr.set_message(format!("download {filename}"));
         HTTP.download_file(&url, &file_path, Some(ctx.pr.as_ref()))
             .await?;
 
-        // Verify artifact
+        // Verify artifact (checksum if provided)
+        if get_opt(&opts, "checksum").is_some() {
+            ctx.pr.next_operation();
+        }
         verify_artifact(&tv, &file_path, &opts, Some(ctx.pr.as_ref()))?;
 
         // Generate cache key
@@ -672,6 +680,7 @@ impl Backend for HttpBackend {
         // Determine extraction type based on whether we're using cache or extracting fresh
         // On cache hit, we need to detect the actual filename from the cache (which may differ
         // from current options if a previous extraction used different `bin` name)
+        ctx.pr.next_operation();
         let extraction_type = if self.is_cached(&cache_key) {
             ctx.pr.set_message("using cached tarball".into());
             // Report extraction operation as complete (instant since we're using cache)
@@ -680,7 +689,14 @@ impl Backend for HttpBackend {
             self.extraction_type_from_cache(&cache_key, &file_info)
         } else {
             ctx.pr.set_message("extracting to cache".into());
-            self.extract_to_cache(&file_path, &cache_key, &url, &opts, Some(ctx.pr.as_ref()))?
+            self.extract_to_cache(
+                &tv,
+                &file_path,
+                &cache_key,
+                &url,
+                &opts,
+                Some(ctx.pr.as_ref()),
+            )?
         };
 
         // Create symlinks
@@ -688,6 +704,9 @@ impl Backend for HttpBackend {
         self.create_version_alias_symlink(&tv, &cache_key)?;
 
         // Verify checksum for lockfile
+        if lockfile_enabled || has_lockfile_checksum {
+            ctx.pr.next_operation();
+        }
         self.verify_checksum(ctx, &mut tv, &file_path)?;
 
         Ok(tv)

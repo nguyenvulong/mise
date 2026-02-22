@@ -17,7 +17,7 @@ pub struct TestTool {
     /// Tool(s) to test
     #[clap(required_unless_present_any = ["all", "all_config"])]
     pub tools: Option<Vec<ToolArg>>,
-    /// Test every tool specified in registry.toml
+    /// Test every tool specified in registry/
     #[clap(long, short, conflicts_with = "tools", conflicts_with = "all_config")]
     pub all: bool,
     /// Number of jobs to run in parallel
@@ -27,7 +27,7 @@ pub struct TestTool {
     /// Test all tools specified in config files
     #[clap(long, conflicts_with = "tools", conflicts_with = "all")]
     pub all_config: bool,
-    /// Also test tools not defined in registry.toml, guessing how to test it
+    /// Also test tools not defined in registry/, guessing how to test it
     #[clap(long)]
     pub include_non_defined: bool,
     /// Directly pipe stdin/stdout/stderr from plugin to user
@@ -215,8 +215,8 @@ impl TestTool {
             raw: self.raw,
             ..Default::default()
         };
-        ts.install_missing_versions(config, &opts).await?;
-        ts.notify_if_versions_missing(config).await;
+        let (_, missing) = ts.install_missing_versions(config, &opts).await?;
+        ts.notify_missing_versions(missing);
         let tv = if let Some(tv) = ts
             .versions
             .get(tool.ba.as_ref())
@@ -254,6 +254,14 @@ impl TestTool {
             Some(0) => {}
             Some(code) => {
                 if code == 127 {
+                    // Show captured stdout (which may include stderr via 2>&1)
+                    // to help diagnose dynamic linker or missing library errors
+                    if let Ok(stdout) = String::from_utf8(res.stdout.clone()) {
+                        let stdout = stdout.trim();
+                        if !stdout.is_empty() {
+                            info!("command output:\n{stdout}");
+                        }
+                    }
                     let bin_dirs = backend.list_bin_paths(config, &tv).await?;
                     for bin_dir in &bin_dirs {
                         let bins = file::ls(bin_dir)?

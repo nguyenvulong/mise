@@ -1,7 +1,7 @@
 use crate::backend::aqua::{arch, os};
 use crate::config::Settings;
 use crate::git::{CloneOptions, Git};
-use crate::{dirs, duration::WEEKLY, env, file};
+use crate::{dirs, duration::WEEKLY, file};
 use aqua_registry::{AquaRegistry, AquaRegistryConfig};
 use eyre::Result;
 use std::collections::HashMap;
@@ -70,7 +70,7 @@ impl MiseAquaRegistry {
             cache_dir: path.clone(),
             registry_url: registry_url.map(|s| s.to_string()),
             use_baked_registry: settings.aqua.baked_registry,
-            prefer_offline: env::PREFER_OFFLINE.load(std::sync::atomic::Ordering::Relaxed),
+            prefer_offline: settings.prefer_offline(),
         };
 
         let inner = AquaRegistry::new(config);
@@ -106,14 +106,54 @@ fn fetch_latest_repo(repo: &Git) -> Result<()> {
         return Ok(());
     }
 
-    if env::PREFER_OFFLINE.load(std::sync::atomic::Ordering::Relaxed) {
-        trace!("skipping aqua registry update due to PREFER_OFFLINE");
+    if Settings::get().prefer_offline() {
+        trace!("skipping aqua registry update due to prefer-offline mode");
         return Ok(());
     }
 
     info!("updating aqua registry repo");
     repo.update(None)?;
     Ok(())
+}
+
+struct AquaSuggestionsCache {
+    name_to_ids: HashMap<&'static str, Vec<&'static str>>,
+    names: Vec<&'static str>,
+}
+
+static AQUA_SUGGESTIONS_CACHE: Lazy<AquaSuggestionsCache> = Lazy::new(|| {
+    let ids = aqua_registry::package_ids();
+    let mut name_to_ids: HashMap<&'static str, Vec<&'static str>> = HashMap::new();
+    for id in ids {
+        if let Some((_, name)) = id.rsplit_once('/') {
+            name_to_ids.entry(name).or_default().push(id);
+        }
+    }
+    let names = name_to_ids.keys().copied().collect();
+    AquaSuggestionsCache { name_to_ids, names }
+});
+
+/// Search aqua packages by tool name, returning "owner/name" IDs
+/// where the name part is similar to the query.
+pub fn aqua_suggest(query: &str) -> Vec<String> {
+    let cache = &*AQUA_SUGGESTIONS_CACHE;
+
+    // Use a higher threshold (0.8) to avoid noisy suggestions
+    let similar_names = xx::suggest::similar_n_with_threshold(query, &cache.names, 5, 0.8);
+
+    // Map back to full IDs
+    let mut results = Vec::new();
+    for matched_name in &similar_names {
+        if let Some(full_ids) = cache.name_to_ids.get(matched_name.as_str()) {
+            for full_id in full_ids {
+                results.push(full_id.to_string());
+                if results.len() >= 5 {
+                    return results;
+                }
+            }
+        }
+    }
+    results
 }
 
 // Re-export types and static for compatibility

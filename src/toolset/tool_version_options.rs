@@ -76,11 +76,12 @@ impl ToolVersionOptions {
 
         // Get the root value and try to parse it as TOML
         if let Some(value) = self.opts.get(root_key) {
-            if let Ok(toml_value) = value.parse::<toml::Value>() {
+            if let Ok(toml_value) = toml::de::from_str::<toml::Value>(value) {
                 return Self::value_exists_at_path(&toml_value, nested_path);
             } else if value.trim().starts_with('{') && value.trim().ends_with('}') {
                 // Try to parse as inline TOML table
-                if let Ok(toml_value) = format!("value = {value}").parse::<toml::Value>()
+                if let Ok(toml_value) =
+                    toml::de::from_str::<toml::Value>(&format!("value = {value}"))
                     && let Some(table_value) = toml_value.get("value")
                 {
                     return Self::value_exists_at_path(table_value, nested_path);
@@ -121,11 +122,12 @@ impl ToolVersionOptions {
 
         // Get the root value and try to parse it as TOML
         if let Some(value) = self.opts.get(root_key) {
-            if let Ok(toml_value) = value.parse::<toml::Value>() {
+            if let Ok(toml_value) = toml::de::from_str::<toml::Value>(value) {
                 return Self::get_string_at_path(&toml_value, nested_path);
             } else if value.trim().starts_with('{') && value.trim().ends_with('}') {
                 // Try to parse as inline TOML table
-                if let Ok(toml_value) = format!("value = {value}").parse::<toml::Value>()
+                if let Ok(toml_value) =
+                    toml::de::from_str::<toml::Value>(&format!("value = {value}"))
                     && let Some(table_value) = toml_value.get("value")
                 {
                     return Self::get_string_at_path(table_value, nested_path);
@@ -162,12 +164,22 @@ impl ToolVersionOptions {
 
 pub fn parse_tool_options(s: &str) -> ToolVersionOptions {
     let mut tvo = ToolVersionOptions::default();
+    let mut current_key: Option<String> = None;
     for opt in s.split(',') {
-        let (k, v) = opt.split_once('=').unwrap_or((opt, ""));
-        if k.is_empty() {
-            continue;
+        if let Some((k, v)) = opt.split_once('=') {
+            if !k.trim().is_empty() {
+                tvo.opts.insert(k.trim().to_string(), v.to_string());
+                current_key = Some(k.trim().to_string());
+            }
+        } else if !opt.is_empty() {
+            // No '=' found, append to the previous value or create a new key
+            if let Some(key) = &current_key
+                && let Some(existing_value) = tvo.opts.get_mut(key)
+            {
+                existing_value.push(',');
+                existing_value.push_str(opt);
+            }
         }
-        tvo.opts.insert(k.to_string(), v.to_string());
     }
     tvo
 }
@@ -202,6 +214,52 @@ mod tests {
                 opts: [
                     ("exe".to_string(), "rg".to_string()),
                     ("match".to_string(), "musl".to_string()),
+                ]
+                .iter()
+                .cloned()
+                .collect(),
+                ..Default::default()
+            },
+        );
+        t(
+            "profile=minimal,components=rust-src,llvm-tools,targets=wasm32-unknown-unknown,thumbv2-none-eabi",
+            ToolVersionOptions {
+                opts: [
+                    ("profile".to_string(), "minimal".to_string()),
+                    ("components".to_string(), "rust-src,llvm-tools".to_string()),
+                    (
+                        "targets".to_string(),
+                        "wasm32-unknown-unknown,thumbv2-none-eabi".to_string(),
+                    ),
+                ]
+                .iter()
+                .cloned()
+                .collect(),
+                ..Default::default()
+            },
+        );
+        // test trimming of key whitespace
+        t(
+            "  exe =  rg  ,  match = musl  ",
+            ToolVersionOptions {
+                opts: [
+                    ("exe".to_string(), "  rg  ".to_string()),
+                    ("match".to_string(), " musl  ".to_string()),
+                ]
+                .iter()
+                .cloned()
+                .collect(),
+                ..Default::default()
+            },
+        );
+        // test value-less keys
+        t(
+            "foo=,bar=baz,baz=",
+            ToolVersionOptions {
+                opts: [
+                    ("foo".to_string(), "".to_string()),
+                    ("bar".to_string(), "baz".to_string()),
+                    ("baz".to_string(), "".to_string()),
                 ]
                 .iter()
                 .cloned()

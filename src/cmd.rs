@@ -8,10 +8,13 @@ use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
+use crate::redactions::Redactor;
 use color_eyre::Result;
 use duct::{Expression, IntoExecutablePath};
 use eyre::Context;
-use indexmap::IndexSet;
 #[cfg(not(any(test, target_os = "windows")))]
 use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR1, SIGUSR2};
 #[cfg(not(any(test, target_os = "windows")))]
@@ -23,6 +26,7 @@ use crate::env;
 use crate::env::PATH_KEY;
 use crate::errors::Error::ScriptFailed;
 use crate::file::display_path;
+use crate::path_env::PathEnv;
 use crate::ui::progress_report::SingleReport;
 
 /// Create a command with any number of of positional arguments
@@ -101,7 +105,7 @@ pub struct CmdLineRunner<'a> {
     pr: Option<&'a dyn SingleReport>,
     pr_arc: Option<Arc<Box<dyn SingleReport>>>,
     stdin: Option<String>,
-    redactions: IndexSet<String>,
+    redactor: Redactor,
     raw: bool,
     pass_signals: bool,
     on_stdout: Option<Box<dyn Fn(String) + Send + 'a>>,
@@ -124,7 +128,7 @@ impl<'a> CmdLineRunner<'a> {
             pr: None,
             pr_arc: None,
             stdin: None,
-            redactions: Default::default(),
+            redactor: Default::default(),
             raw: false,
             pass_signals: false,
             on_stdout: None,
@@ -137,9 +141,13 @@ impl<'a> CmdLineRunner<'a> {
         let pids = RUNNING_PIDS.lock().unwrap();
         for pid in pids.iter() {
             let pid = *pid as i32;
-            trace!("{signal}: {pid}");
-            if let Err(e) = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), signal) {
-                debug!("Failed to kill cmd {pid}: {e}");
+            let nix_pid = nix::unistd::Pid::from_raw(pid);
+            trace!("{signal}: pgid {pid}");
+            if nix::sys::signal::killpg(nix_pid, signal).is_err() {
+                trace!("killpg failed for {pid}, falling back to kill");
+                if let Err(e) = nix::sys::signal::kill(nix_pid, signal) {
+                    debug!("Failed to kill cmd {pid}: {e}");
+                }
             }
         }
     }
@@ -176,11 +184,7 @@ impl<'a> CmdLineRunner<'a> {
     }
 
     pub fn redact(mut self, redactions: impl IntoIterator<Item = String>) -> Self {
-        for r in redactions {
-            if !r.is_empty() {
-                self.redactions.insert(r);
-            }
-        }
+        self.redactor = self.redactor.with_additional(redactions);
         self
     }
 
@@ -227,11 +231,11 @@ impl<'a> CmdLineRunner<'a> {
             .get_env(&PATH_KEY)
             .map(|c| c.to_owned())
             .unwrap_or_else(|| env::var_os(&*PATH_KEY).unwrap());
-        let paths = paths
-            .into_iter()
-            .chain(env::split_paths(&existing))
-            .collect::<Vec<_>>();
-        self.cmd.env(&*PATH_KEY, env::join_paths(paths)?);
+        let mut path_env = PathEnv::from_iter(env::split_paths(&existing));
+        for p in paths {
+            path_env.add(p);
+        }
+        self.cmd.env(&*PATH_KEY, path_env.join());
         Ok(self)
     }
 
@@ -242,13 +246,6 @@ impl<'a> CmdLineRunner<'a> {
             }
         }
         None
-    }
-
-    pub fn opt_arg<S: AsRef<OsStr>>(mut self, arg: Option<S>) -> Self {
-        if let Some(arg) = arg {
-            self.cmd.arg(arg);
-        }
-        self
     }
 
     pub fn opt_args<S: AsRef<OsStr>>(mut self, arg: &str, values: Option<Vec<S>>) -> Self {
@@ -309,9 +306,18 @@ impl<'a> CmdLineRunner<'a> {
             let _write_lock = RAW_LOCK.write().unwrap();
             return self.execute_raw();
         }
+        #[cfg(unix)]
+        unsafe {
+            self.cmd.pre_exec(|| {
+                let _ = nix::unistd::setpgid(
+                    nix::unistd::Pid::from_raw(0),
+                    nix::unistd::Pid::from_raw(0),
+                );
+                Ok(())
+            });
+        }
         let mut cp = self
-            .cmd
-            .spawn()
+            .spawn_with_etxtbsy_retry()
             .wrap_err_with(|| format!("failed to execute command: {self}"))?;
         let id = cp.id();
         RUNNING_PIDS.lock().unwrap().insert(id);
@@ -379,20 +385,14 @@ impl<'a> CmdLineRunner<'a> {
         for line in rx {
             match line {
                 ChildProcessOutput::Stdout(line) => {
-                    let line = self
-                        .redactions
-                        .iter()
-                        .fold(line, |acc, r| acc.replace(r, "[redacted]"));
+                    let line = self.redactor.redact(&line);
                     self.on_stdout(line.clone());
-                    combined_output.push(line);
+                    combined_output.push((line, OutputSource::Stdout));
                 }
                 ChildProcessOutput::Stderr(line) => {
-                    let line = self
-                        .redactions
-                        .iter()
-                        .fold(line, |acc, r| acc.replace(r, "[redacted]"));
+                    let line = self.redactor.redact(&line);
                     self.on_stderr(line.clone());
-                    combined_output.push(line);
+                    combined_output.push((line, OutputSource::Stderr));
                 }
                 ChildProcessOutput::ExitStatus(s) => {
                     RUNNING_PIDS.lock().unwrap().remove(&id);
@@ -400,11 +400,11 @@ impl<'a> CmdLineRunner<'a> {
                 }
                 #[cfg(not(any(test, windows)))]
                 ChildProcessOutput::Signal(sig) => {
-                    if sig != SIGINT {
-                        debug!("Received signal {sig}, {id}");
-                        let pid = nix::unistd::Pid::from_raw(id as i32);
-                        let sig = nix::sys::signal::Signal::try_from(sig).unwrap();
-                        nix::sys::signal::kill(pid, sig)?;
+                    debug!("Received signal {sig}, forwarding to pgid {id}");
+                    let pgid = nix::unistd::Pid::from_raw(id as i32);
+                    let sig = nix::sys::signal::Signal::try_from(sig).unwrap();
+                    if nix::sys::signal::killpg(pgid, sig).is_err() {
+                        let _ = nix::sys::signal::kill(pgid, sig);
                     }
                 }
             }
@@ -413,18 +413,47 @@ impl<'a> CmdLineRunner<'a> {
         let status = status.unwrap();
 
         if !status.success() {
-            self.on_error(combined_output.join("\n"), status)?;
+            self.on_error(combined_output, status)?;
         }
 
         Ok(())
     }
 
     fn execute_raw(mut self) -> Result<()> {
-        let status = self.cmd.spawn()?.wait()?;
+        let status = self.spawn_with_etxtbsy_retry()?.wait()?;
         match status.success() {
             true => Ok(()),
-            false => self.on_error(String::new(), status),
+            false => self.on_error(vec![], status),
         }
+    }
+
+    /// Retry spawning a process if it fails with ETXTBSY (Text file busy).
+    /// This can happen on Linux when executing a binary that was just written/extracted,
+    /// as the file descriptor may not be fully closed yet.
+    fn spawn_with_etxtbsy_retry(&mut self) -> std::io::Result<std::process::Child> {
+        let mut attempt = 0;
+        loop {
+            match self.cmd.spawn() {
+                Ok(child) => return Ok(child),
+                Err(err) if Self::is_etxtbsy(&err) && attempt < 3 => {
+                    attempt += 1;
+                    trace!("retrying spawn after ETXTBSY (attempt {}/3)", attempt);
+                    // Exponential backoff: 50ms, 100ms, 200ms
+                    std::thread::sleep(std::time::Duration::from_millis(50 * (1 << (attempt - 1))));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn is_etxtbsy(err: &std::io::Error) -> bool {
+        err.raw_os_error() == Some(nix::errno::Errno::ETXTBSY as i32)
+    }
+
+    #[cfg(not(unix))]
+    fn is_etxtbsy(_err: &std::io::Error) -> bool {
+        false
     }
 
     fn on_stdout(&self, line: String) {
@@ -472,15 +501,27 @@ impl<'a> CmdLineRunner<'a> {
         }
     }
 
-    fn on_error(&self, output: String, status: ExitStatus) -> Result<()> {
+    fn on_error(&self, output: Vec<(String, OutputSource)>, status: ExitStatus) -> Result<()> {
         match self
             .pr
             .or(self.pr_arc.as_ref().map(|arc| arc.as_ref().as_ref()))
         {
             Some(pr) => {
                 error!("{} failed", self.get_program());
-                if !Settings::get().verbose && !output.trim().is_empty() {
-                    pr.println(output);
+                if self.on_stdout.is_none() {
+                    // Stdout was hidden behind the progress indicator
+                    // (pr.set_message) so replay it on failure. Only replay
+                    // stdout — stderr was already printed during execution
+                    // via pr.println.
+                    let stdout_only: String = output
+                        .into_iter()
+                        .filter(|(_, source)| matches!(source, OutputSource::Stdout))
+                        .map(|(line, _)| line)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !stdout_only.trim().is_empty() {
+                        pr.println(stdout_only);
+                    }
                 }
             }
             None => {
@@ -514,6 +555,13 @@ impl Debug for CmdLineRunner<'_> {
         let args = self.get_args().join(" ");
         write!(f, "{} {args}", self.get_program())
     }
+}
+
+/// Tracks whether an output line came from stdout or stderr,
+/// so on_error can decide which lines need replaying.
+enum OutputSource {
+    Stdout,
+    Stderr,
 }
 
 enum ChildProcessOutput {

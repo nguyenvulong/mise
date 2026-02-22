@@ -161,7 +161,7 @@ impl ToolRequestSetBuilder {
     // }
     //
 
-    pub async fn build(&self, config: &Config) -> eyre::Result<ToolRequestSet> {
+    pub async fn build(&self, config: &Arc<Config>) -> eyre::Result<ToolRequestSet> {
         let mut trs = ToolRequestSet::default();
         trs = self.load_config_files(config, trs).await?;
         trs = self.load_runtime_env(trs)?;
@@ -192,7 +192,7 @@ impl ToolRequestSetBuilder {
 
     async fn load_config_files(
         &self,
-        config: &Config,
+        config: &Arc<Config>,
         mut trs: ToolRequestSet,
     ) -> eyre::Result<ToolRequestSet> {
         for cf in config.config_files.values().rev() {
@@ -208,8 +208,8 @@ impl ToolRequestSetBuilder {
                     .trim_start_matches("MISE_")
                     .trim_end_matches("_VERSION")
                     .to_lowercase();
-                if plugin_name == "install" {
-                    // ignore MISE_INSTALL_VERSION
+                if plugin_name == "install" || plugin_name == "tool" {
+                    // ignore MISE_INSTALL_VERSION and MISE_TOOL_VERSION (set during hooks)
                     continue;
                 }
                 let ba: Arc<BackendArg> = Arc::new(plugin_name.as_str().into());
@@ -250,7 +250,18 @@ impl ToolRequestSetBuilder {
         let mut arg_trs = ToolRequestSet::new();
         for arg in tool_args.iter() {
             if let Some(tvr) = &arg.tvr {
-                arg_trs.add_version(tvr.clone(), &ToolSource::Argument);
+                let mut tvr = tvr.clone();
+                // When CLI specifies a version for a tool that's in config,
+                // merge config options (e.g. postinstall) into the CLI request
+                if tvr.options().is_empty()
+                    && let Some(config_tvr) = trs.tools.get(&arg.ba).and_then(|v| v.first())
+                {
+                    let config_opts = config_tvr.options();
+                    if !config_opts.is_empty() {
+                        tvr.set_options(config_opts);
+                    }
+                }
+                arg_trs.add_version(tvr, &ToolSource::Argument);
             } else if !trs.tools.contains_key(&arg.ba) {
                 // no active version, so use "latest"
                 let tr = ToolRequest::new(arg.ba.clone(), "latest", ToolSource::Argument)?;

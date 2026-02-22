@@ -4,6 +4,7 @@ use crate::http;
 use crate::http::HTTP_FETCH;
 use crate::plugins::core::CORE_PLUGINS;
 use crate::registry::REGISTRY;
+use reqwest::header::{HeaderMap, HeaderValue};
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -12,6 +13,15 @@ use std::{
     },
 };
 use tokio::sync::Mutex;
+
+/// Headers for requests to mise-versions, including CI detection
+static VERSIONS_HOST_HEADERS: LazyLock<HeaderMap> = LazyLock::new(|| {
+    let mut headers = HeaderMap::new();
+    if ci_info::is_ci() {
+        headers.insert("x-mise-ci", HeaderValue::from_static("true"));
+    }
+    headers
+});
 
 /// Tools that use the versions host for listing versions
 /// (excludes java/python due to complex version schemes)
@@ -50,7 +60,11 @@ struct VersionEntry {
 /// List versions from the versions host (mise-versions.jdx.dev).
 /// Returns Vec<VersionInfo> with created_at timestamps from the TOML endpoint.
 pub async fn list_versions(tool: &str) -> eyre::Result<Option<Vec<VersionInfo>>> {
-    if !Settings::get().use_versions_host || !PLUGINS_USE_VERSION_HOST.contains(tool) {
+    let settings = Settings::get();
+    if settings.prefer_offline()
+        || !settings.use_versions_host
+        || !PLUGINS_USE_VERSION_HOST.contains(tool)
+    {
         return Ok(None);
     }
 
@@ -68,7 +82,10 @@ pub async fn list_versions(tool: &str) -> eyre::Result<Option<Vec<VersionInfo>>>
 
     // Use TOML format which includes created_at timestamps
     let url = format!("https://mise-versions.jdx.dev/tools/{}.toml", tool);
-    let versions: Vec<VersionInfo> = match HTTP_FETCH.get_text(&url).await {
+    let versions: Vec<VersionInfo> = match HTTP_FETCH
+        .get_text_with_headers(&url, &VERSIONS_HOST_HEADERS)
+        .await
+    {
         Ok(body) => {
             let response: VersionsResponse = toml::from_str(&body)?;
             response
@@ -114,6 +131,9 @@ pub async fn list_versions(tool: &str) -> eyre::Result<Option<Vec<VersionInfo>>>
 /// Tracks all core plugins and registry tools (including java/python)
 pub fn track_install(tool: &str, full: &str, version: &str) {
     let settings = Settings::get();
+    if settings.offline() {
+        return;
+    }
 
     // Check if tracking is enabled (also requires use_versions_host to be enabled)
     if !settings.use_versions_host || !settings.use_versions_host_track {
@@ -150,7 +170,10 @@ async fn track_install_async(tool: &str, full: &str, version: &str) -> eyre::Res
         "arch": *ARCH
     });
 
-    match HTTP_FETCH.post_json(url, &body).await {
+    match HTTP_FETCH
+        .post_json_with_headers(url, &body, &VERSIONS_HOST_HEADERS)
+        .await
+    {
         Ok(true) => trace!("Tracked install: {full}@{version}"),
         Ok(false) => trace!("Track request failed"),
         Err(e) => trace!("Track request error: {e}"),

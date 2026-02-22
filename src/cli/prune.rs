@@ -5,10 +5,10 @@ use crate::cli::args::{BackendArg, ToolArg};
 use crate::config::tracking::Tracker;
 use crate::config::{Config, Settings};
 use crate::runtime_symlinks;
-use crate::toolset::{ToolVersion, Toolset, ToolsetBuilder};
+use crate::toolset::{ToolVersion, ToolsetBuilder, get_versions_needed_by_tracked_configs};
 use crate::ui::multi_progress_report::MultiProgressReport;
 use crate::ui::prompt;
-use crate::{backend::Backend, config};
+use crate::{backend::Backend, config, exit};
 use console::style;
 use eyre::Result;
 
@@ -37,12 +37,22 @@ pub struct Prune {
     #[clap(long)]
     pub configs: bool,
 
+    /// Like --dry-run but exits with code 1 if there are tools to prune
+    ///
+    /// This is useful for scripts to check if tools need to be pruned.
+    #[clap(long, verbatim_doc_comment)]
+    pub dry_run_code: bool,
+
     /// Prune only unused versions of tools
     #[clap(long)]
     pub tools: bool,
 }
 
 impl Prune {
+    fn is_dry_run(&self) -> bool {
+        self.dry_run || self.dry_run_code
+    }
+
     pub async fn run(self) -> Result<()> {
         let mut config = Config::get().await?;
         if self.configs || !self.tools {
@@ -53,7 +63,16 @@ impl Prune {
                 .installed_tool
                 .as_ref()
                 .map(|it| it.iter().map(|ta| ta.ba.as_ref()).collect());
-            prune(&config, backends.unwrap_or_default(), self.dry_run).await?;
+            let tools = backends.unwrap_or_default();
+            let to_delete = prunable_tools(&config, tools).await?;
+            let has_work = !to_delete.is_empty();
+            delete(&config, self.is_dry_run(), to_delete).await?;
+            if self.dry_run_code && has_work {
+                exit::exit(1);
+            }
+            if self.is_dry_run() {
+                return Ok(());
+            }
             config = Config::reset().await?;
             let ts = config.get_toolset().await?;
             config::rebuild_shims_and_runtime_symlinks(&config, ts, &[]).await?;
@@ -62,7 +81,7 @@ impl Prune {
     }
 
     fn prune_configs(&self) -> Result<()> {
-        if self.dry_run {
+        if self.is_dry_run() {
             info!("pruned configuration links {}", style("[dryrun]").bold());
         } else {
             Tracker::clean()?;
@@ -89,12 +108,10 @@ pub async fn prunable_tools(
         to_delete.retain(|_, (_, tv)| tools.contains(&tv.ba()));
     }
 
-    for cf in config.get_tracked_config_files().await?.values() {
-        let mut ts = Toolset::from(cf.to_tool_request_set()?);
-        ts.resolve(config).await?;
-        for (_, tv) in ts.list_current_versions() {
-            to_delete.remove(&(tv.ba().short.to_string(), tv.tv_pathname()));
-        }
+    // Remove versions that are still needed by tracked configs
+    let needed_versions = get_versions_needed_by_tracked_configs(config).await?;
+    for key in needed_versions {
+        to_delete.remove(&key);
     }
 
     Ok(to_delete.into_values().collect())

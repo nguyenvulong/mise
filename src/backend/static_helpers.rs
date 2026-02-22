@@ -130,10 +130,26 @@ where
     Fut: Future<Output = std::result::Result<T, E>>,
     E: VerifiableError,
 {
+    try_with_v_prefix_and_repo(version, version_prefix, None, resolver).await
+}
+
+/// Helper to try various tag formats for a resolver function
+/// Tries version_prefix (if set), v prefix, and optionally repo@version formats
+pub async fn try_with_v_prefix_and_repo<F, Fut, T, E>(
+    version: &str,
+    version_prefix: Option<&str>,
+    repo: Option<&str>,
+    resolver: F,
+) -> Result<T>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = std::result::Result<T, E>>,
+    E: VerifiableError,
+{
     let mut errors = vec![];
 
     // Generate candidates based on version prefix configuration
-    let candidates = if let Some(prefix) = version_prefix {
+    let mut candidates = if let Some(prefix) = version_prefix {
         // If a custom prefix is configured, try both prefixed and non-prefixed versions
         if version.starts_with(prefix) {
             vec![
@@ -143,6 +159,8 @@ where
         } else {
             vec![format!("{}{}", prefix, version), version.to_string()]
         }
+    } else if version == "latest" {
+        vec![version.to_string()]
     } else if version.starts_with('v') {
         vec![
             version.to_string(),
@@ -151,6 +169,21 @@ where
     } else {
         vec![format!("v{version}"), version.to_string()]
     };
+
+    // Also try repo@version formats (e.g., tectonic@0.15.0) when no prefix is configured
+    // Try both the repo short name and full repo name
+    // Skip this for "latest" since it's a special keyword, not an actual tag
+    if version_prefix.is_none()
+        && version != "latest"
+        && let Some(full_repo) = repo
+    {
+        // Try short name first (more common), e.g., "tectonic@0.15.0"
+        if let Some(short_name) = full_repo.split('/').next_back() {
+            candidates.push(format!("{}@{}", short_name, version));
+        }
+        // Also try full repo name, e.g., "tectonic-typesetting/tectonic@0.15.0"
+        candidates.push(format!("{}@{}", full_repo, version));
+    }
 
     for candidate in candidates {
         match resolver(candidate).await {
@@ -331,6 +364,7 @@ pub fn template_string(template: &str, tv: &ToolVersion) -> String {
     if template.contains("{version}") && !template.contains("{{version}}") {
         deprecated_at!(
             "2026.3.0",
+            "2027.3.0",
             "legacy-version-template",
             "Use {{{{ version }}}} instead of {{version}} in URL templates"
         );
@@ -594,7 +628,7 @@ fn should_skip_file(file_name: &str, strict: bool) -> bool {
 /// - `tool_name`: Optional hint for finding non-executable files by name matching.
 ///   When provided, if no executable is found, will search for files matching the tool name
 ///   and make them executable before renaming.
-fn rename_executable_in_dir(
+pub fn rename_executable_in_dir(
     dir: &Path,
     new_name: &str,
     tool_name: Option<&str>,
@@ -605,6 +639,33 @@ fn rename_executable_in_dir(
     // (read_dir order is non-deterministic, so we must check first)
     if target_path.is_file() && file::is_executable(&target_path) {
         return Ok(());
+    }
+
+    // Check for stripped macOS .app bundle (Contents/MacOS at root level)
+    // This happens when auto-strip removes the .app wrapper directory
+    let contents_macos = dir.join("Contents").join("MacOS");
+    if contents_macos.is_dir() {
+        // Rename within Contents/MacOS instead of moving to root
+        let target_in_macos = contents_macos.join(new_name);
+        if rename_executable_in_app_bundle(&contents_macos, &target_in_macos, tool_name)? {
+            return Ok(());
+        }
+    }
+
+    // Check for macOS .app bundles and look inside Contents/MacOS/
+    for entry in file::ls(dir)? {
+        if entry.is_dir() {
+            let dir_name = entry.file_name().unwrap().to_string_lossy();
+            if dir_name.ends_with(".app") {
+                let macos_dir = entry.join("Contents").join("MacOS");
+                if macos_dir.is_dir() {
+                    // Try to rename executable inside the .app bundle
+                    if rename_executable_in_app_bundle(&macos_dir, &target_path, tool_name)? {
+                        return Ok(());
+                    }
+                }
+            }
+        }
     }
 
     // First pass: Find executables in the directory (non-recursive for top level)
@@ -645,6 +706,54 @@ fn rename_executable_in_dir(
     }
 
     Ok(())
+}
+
+/// Helper function to rename executable inside a macOS .app bundle
+fn rename_executable_in_app_bundle(
+    macos_dir: &Path,
+    target_path: &Path,
+    tool_name: Option<&str>,
+) -> eyre::Result<bool> {
+    // Find the first executable in the Contents/MacOS directory
+    for path in file::ls(macos_dir)? {
+        if path.is_file() && file::is_executable(&path) {
+            let file_name = path.file_name().unwrap().to_string_lossy();
+            if should_skip_file(&file_name, false) {
+                continue;
+            }
+            file::rename(&path, target_path)?;
+            debug!(
+                "Renamed .app bundle executable {} to {}",
+                path.display(),
+                target_path.display()
+            );
+            return Ok(true);
+        }
+    }
+
+    // If no executable found, try matching by tool name
+    if let Some(tool_name) = tool_name {
+        for path in file::ls(macos_dir)? {
+            if path.is_file() {
+                let file_name = path.file_name().unwrap().to_string_lossy();
+                if should_skip_file(&file_name, true) {
+                    continue;
+                }
+                if file_name.to_lowercase().contains(&tool_name.to_lowercase()) {
+                    file::make_executable(&path)?;
+                    file::rename(&path, target_path)?;
+                    debug!(
+                        "Found and renamed .app bundle file {} to {} (added exec permissions)",
+                        path.display(),
+                        target_path.display()
+                    );
+                    return Ok(true);
+                }
+            }
+        }
+    }
+
+    Ok(false)
 }
 
 /// Cleans a binary name by removing OS/arch suffixes and version numbers.
